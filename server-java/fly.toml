@@ -1,0 +1,25 @@
+# Fly.io config for the baby monitor server, Java edition (signaling + REST API in one process, TR7).
+app = "babymonitor-server-java"
+primary_region = "arn"
+
+[build]
+
+[env]
+  DB_PATH = "/data/babymonitor.db"
+
+[mounts]
+  source = "babymonitor_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Keep exactly one machine running: rooms and WebSocket sessions live in memory.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # The JVM needs more headroom than Node (256 MB there): Jetty + heap + metaspace.
+  memory = "512mb"
