@@ -1,12 +1,18 @@
-/// WebRTC session facades (docs/PROTOCOL.md §2, §4, §5.3).
+/// WebRTC session facades (docs/PROTOCOL.md §2, §4, §5.3, §7, §8, §9).
 ///
-/// [CameraSession]: one `RTCPeerConnection` per joined parent (F8, max
-/// enforced server-side), local capture, `health` data channels, heartbeats,
-/// noise monitoring, wakelock, room create/reclaim.
+/// [CameraSession]: one `RTCPeerConnection` per joined parent (F8), local
+/// capture, `health` data channels, heartbeats, noise monitoring, wakelock. It
+/// runs **two signaling transports at once** — the camera-hosted LAN server
+/// (golden path, started first per NTR7) and, detached and best-effort, the
+/// cloud relay — feeding both into one transport-agnostic message handler. It
+/// drives §8.2 camera-side auth (challenge → verify → offer, else NOT_TRUSTED)
+/// and the §8.1 pairing ceremony.
 ///
-/// [ParentSession]: single PC answering the camera's offer, health FSM
-/// wiring, freeze detection -> ice-restart, push-to-talk, auto-rejoin with
-/// backoff (F4).
+/// [ParentSession]: single PC answering the camera's offer, health FSM wiring,
+/// freeze detection → ice-restart, push-to-talk, auto-rejoin with backoff (F4)
+/// over the LAN-first multi-endpoint client (§7). In trusted mode it sends
+/// `auth` and verifies the camera's challenge, raising a security alert on a
+/// key mismatch (§8.2).
 ///
 /// No UI code lives here; everything is exposed as streams/getters. Failures
 /// are swallowed and logged — the services never throw at the UI (NTR3).
@@ -21,17 +27,29 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../config/app_config.dart';
+import '../core/auth_engine.dart';
 import '../core/backoff_scheduler.dart';
 import '../core/freeze_detector.dart';
 import '../core/health_monitor.dart';
 import '../core/health_state.dart';
 import '../core/heartbeat_tracker.dart';
+import '../core/identity.dart';
 import '../core/models.dart';
 import 'api_client.dart';
+import 'crypto_service.dart';
+import 'discovery_service.dart';
+import 'lan_signaling_server.dart';
 import 'noise_monitor.dart';
 import 'settings_service.dart';
 import 'signaling_client.dart';
 import 'sleep_log_service.dart';
+import 'trust_service.dart';
+
+/// Cryptographically-strong random bytes for nonces/tokens.
+List<int> _secureRandomBytes(int count) {
+  final rng = math.Random.secure();
+  return List<int>.generate(count, (_) => rng.nextInt(256));
+}
 
 /// A noise-gate fire received by a parent (F7). Deduplicated on [tsMs]
 /// between the data-channel copy and the signaling fanout copy (§2.3).
@@ -88,12 +106,31 @@ Map<String, dynamic>? _decodeChannelMessage(RTCDataChannelMessage message) {
 // Camera
 // ---------------------------------------------------------------------------
 
+/// A way to reach the parents on one transport (LAN server or cloud relay).
+/// [send] routes a camera-originated message; [dropPeer] force-disconnects a
+/// peer if the transport supports it (LAN only).
+class _CameraTransport {
+  _CameraTransport({required this.name, required this.send, this.dropPeer});
+
+  final String name; // 'lan' | 'cloud'
+  final void Function(Map<String, dynamic> message) send;
+  final Future<void> Function(String peerId)? dropPeer;
+}
+
 class _CameraPeer {
-  _CameraPeer(this.peerId);
+  _CameraPeer(this.peerId, this.transport);
 
   final String peerId;
+  final _CameraTransport transport;
   RTCPeerConnection? pc;
   RTCDataChannel? channel;
+
+  /// True between `auth-challenge` and a verified `auth-response` (§8.2) — no
+  /// offer is sent until the parent is authenticated.
+  bool awaitingAuth = false;
+
+  /// The parent's device id once known (from auth), for revocation drops.
+  String? deviceId;
 
   bool get channelOpen =>
       channel?.state == RTCDataChannelState.RTCDataChannelOpen;
@@ -106,18 +143,32 @@ class CameraSession {
     ApiClient? api,
     SleepLogService? log,
     SettingsService? settings,
+    CryptoService? crypto,
+    TrustService? trust,
+    DiscoveryService? discovery,
     DateTime Function() now = DateTime.now,
   })  : _signaling = signaling ?? SignalingClient(),
         _api = api ?? ApiClient(),
         _log = log,
         _settings = settings,
+        _crypto = crypto,
+        _trust = trust,
+        _discovery = discovery ?? DiscoveryService(),
         _now = now;
 
   final SignalingClient _signaling;
   final ApiClient _api;
   final SleepLogService? _log;
   final SettingsService? _settings;
+  final DiscoveryService _discovery;
   final DateTime Function() _now;
+
+  CryptoService? _crypto;
+  TrustService? _trust;
+  AuthEngine? _authEngine;
+  LanSignalingServer? _lan;
+  _CameraTransport? _lanTx;
+  _CameraTransport? _cloudTx;
 
   final Map<String, _CameraPeer> _peers = {};
   final StreamController<String> _warnings =
@@ -129,8 +180,10 @@ class CameraSession {
   MediaStream? _localStream;
   NoiseMonitor? _noiseMonitor;
   Timer? _hbTimer;
-  StreamSubscription<Map<String, dynamic>>? _msgSub;
-  StreamSubscription<bool>? _connSub;
+  StreamSubscription<Map<String, dynamic>>? _cloudMsgSub;
+  StreamSubscription<bool>? _cloudConnSub;
+  StreamSubscription<Map<String, dynamic>>? _lanMsgSub;
+  StreamSubscription<List<TrustedDevice>>? _trustSub;
   String? _roomId;
   String? _reclaimToken;
   int _hbSeq = 0;
@@ -148,7 +201,7 @@ class CameraSession {
   /// Emits the number of joined parents whenever it changes (F8).
   Stream<int> get parentCount => _parentCount.stream;
 
-  /// The 6-char room code once `room-created` arrives.
+  /// The 6-char cloud room code once `room-created` arrives (null on pure LAN).
   String? get roomId => _roomId;
 
   /// Local capture stream, for an on-screen preview.
@@ -156,9 +209,14 @@ class CameraSession {
 
   int get joinedParents => _peers.length;
 
-  /// Starts capture, wakelock, signaling and monitoring. Never throws for
-  /// recoverable problems — those surface on [warnings]. Media/permission
-  /// failures DO throw: without a camera there is no session.
+  /// Whether pairing mode is active (§8.1).
+  bool get pairingActive => _lan?.pairingActive ?? false;
+
+  /// Starts capture, wakelock, the LAN signaling endpoint and monitoring, then
+  /// registers with the cloud in a detached best-effort task (NTR7 order:
+  /// media → wakelock → LAN + advertise → cloud). Never throws for recoverable
+  /// problems — those surface on [warnings]. Media/permission failures DO
+  /// throw: without a camera there is no session.
   Future<void> start() async {
     if (_started) return;
     _started = true;
@@ -193,13 +251,9 @@ class CameraSession {
           'the screen locks. Keep the device plugged in and unlocked.');
     }
 
-    // 3. Signaling: create (or reclaim) the room. Re-sent on every signaling
-    //    reconnect because the server forgets a closed socket's session.
-    _msgSub = _signaling.messages.listen(_onSignal);
-    _connSub = _signaling.connected.listen((up) {
-      if (up) _sendCreateRoom();
-    });
-    await _signaling.connect();
+    // 3. Golden path, all local: LAN signaling endpoint + mDNS advertise. The
+    //    camera is now fully watchable at home even with the internet down.
+    await _startLan();
 
     // 4. Heartbeats to every parent (F3, §4).
     _hbTimer =
@@ -215,6 +269,62 @@ class CameraSession {
     );
     _noiseMonitor = monitor;
     monitor.start();
+
+    // 6. In parallel, detached: cloud registration for remote viewers. Never
+    //    awaited by start() — a cloud outage must not delay the golden path.
+    _startCloudDetached();
+  }
+
+  Future<void> _startLan() async {
+    try {
+      final crypto = _crypto ??= CryptoService.instance;
+      final trust = _trust ??= TrustService.instance;
+      final engine = _authEngine = AuthEngine(
+        sign: crypto.signer,
+        verify: crypto.verifier,
+        randomBytes: _secureRandomBytes,
+        identity: crypto.identity(_prefs.deviceName),
+      );
+      final lan = LanSignalingServer(authEngine: engine, trust: trust)
+        ..allowCodeJoins = _prefs.allowCodeJoins
+        ..roomCode = _roomId;
+      final tx = _lanTx = _CameraTransport(
+        name: 'lan',
+        send: lan.send,
+        dropPeer: lan.dropPeer,
+      );
+      _lanMsgSub = lan.messages.listen((m) => _onSignal(m, tx));
+      await lan.start();
+      _lan = lan;
+      // Revoked devices are dropped on the next auth and, if live, right away.
+      _trustSub = trust.changes.listen((_) => _enforceTrust());
+
+      // Advertise the LAN endpoint via mDNS (§7).
+      final port = lan.port;
+      if (port != null) {
+        await _discovery.advertise(
+          deviceId: crypto.deviceId,
+          name: _prefs.deviceName,
+          port: port,
+        );
+      }
+    } catch (e) {
+      // The camera still streams to cloud viewers; log and continue (NTR7:
+      // one degraded capability, never a golden-path failure).
+      debugPrint('CameraSession: LAN endpoint start failed: $e');
+      _warn('Local network monitoring is unavailable on this device. '
+          'Parents on the same WiFi may need the internet to connect.');
+    }
+  }
+
+  void _startCloudDetached() {
+    final tx = _cloudTx = _CameraTransport(name: 'cloud', send: _signaling.send);
+    _cloudMsgSub = _signaling.messages.listen((m) => _onSignal(m, tx));
+    _cloudConnSub = _signaling.connected.listen((up) {
+      if (up) _sendCreateRoom(); // re-sent on every reconnect (server forgets)
+    });
+    // Detached: never awaited by start(); its own backoff drives retries.
+    unawaited(_signaling.connect());
   }
 
   /// Applies a new sensitivity ('low'|'medium'|'high') live (F7 AC).
@@ -223,6 +333,35 @@ class CameraSession {
     if (threshold == null) return;
     unawaited(_prefs.setNoiseSensitivity(sensitivity));
     _noiseMonitor?.threshold = threshold;
+  }
+
+  // --- Pairing (§8.1) ---
+
+  /// Enters pairing mode and returns the QR payload string to display, or null
+  /// if the LAN endpoint is unavailable. The token is valid 5 minutes (§8.1).
+  Future<String?> startPairing() async {
+    final lan = _lan;
+    final engine = _authEngine;
+    final crypto = _crypto;
+    if (lan == null || engine == null || crypto == null) return null;
+    final token = engine.issuePairingToken();
+    lan.pairingActive = true;
+    final addrs = await lan.localAddresses();
+    final payload = PairingPayload(
+      deviceId: crypto.deviceId,
+      name: _prefs.deviceName,
+      pk: crypto.publicKeyBase64,
+      port: lan.port ?? kLanSignalingPort,
+      addrs: addrs,
+      token: token,
+    );
+    return payload.serialize();
+  }
+
+  /// Leaves pairing mode and invalidates any outstanding token.
+  Future<void> stopPairing() async {
+    _authEngine?.clearPairingTokens();
+    _lan?.pairingActive = false;
   }
 
   void _sendCreateRoom() {
@@ -236,17 +375,18 @@ class CameraSession {
     }
   }
 
-  void _onSignal(Map<String, dynamic> msg) {
+  void _onSignal(Map<String, dynamic> msg, _CameraTransport transport) {
     try {
       switch (msg['type']) {
         case 'room-created':
           _onRoomCreated(msg);
         case 'peer-joined':
-          final peerId = msg['peerId'];
-          if (peerId is String) unawaited(_createPeer(peerId));
+          _onPeerJoined(msg, transport);
         case 'peer-left':
           final peerId = msg['peerId'];
           if (peerId is String) unawaited(_disposePeer(peerId));
+        case 'auth-response':
+          unawaited(_onAuthResponse(msg));
         case 'answer':
           unawaited(_onAnswer(msg));
         case 'ice':
@@ -270,6 +410,7 @@ class CameraSession {
     if (roomId is! String || token is! String) return;
     _roomId = roomId;
     _reclaimToken = token;
+    _lan?.roomCode = roomId; // enable guest code-joins on LAN too (§7)
     unawaited(_prefs.setCameraRoom(roomId, token));
     if (!_sessionLogged) {
       _sessionLogged = true;
@@ -288,6 +429,7 @@ class CameraSession {
       // Old room is gone (grace period expired) — start a fresh one.
       _roomId = null;
       _reclaimToken = null;
+      _lan?.roomCode = null;
       unawaited(_prefs.clearCameraRoom());
       _warn('Previous room expired — a new room code was created. '
           'Parents must join with the new code.');
@@ -295,15 +437,113 @@ class CameraSession {
     }
   }
 
-  Future<void> _createPeer(String peerId) async {
-    // Rejoin/reclaim: drop any stale PC for this parent first (§2.1).
-    await _disposePeer(peerId);
-    final peer = _CameraPeer(peerId);
+  void _onPeerJoined(Map<String, dynamic> msg, _CameraTransport transport) {
+    final peerId = msg['peerId'];
+    if (peerId is! String) return;
+    // Rejoin/reclaim: drop any stale PC for this parent first (§2.1). The map
+    // removal inside _disposePeer is synchronous, so the fresh peer below wins.
+    if (_peers.containsKey(peerId)) unawaited(_disposePeer(peerId));
+    final peer = _CameraPeer(peerId, transport);
     _peers[peerId] = peer;
     _emitParentCount();
+
+    final auth = msg['auth'];
+    if (auth is Map<String, dynamic>) {
+      // Trusted-device path (§8.2): challenge before any offer.
+      unawaited(_challengePeer(peer, ParentJoinAuth.fromJson(auth)));
+    } else if (_prefs.allowCodeJoins) {
+      // Guest bootstrap (§8.2 bottom): the room code was the authorization.
+      unawaited(_startOffer(peerId));
+    } else {
+      transport.send({
+        'type': 'error',
+        'code': 'NOT_TRUSTED',
+        'peerId': peerId,
+        'message': 'Pair this device to watch',
+      });
+      unawaited(_disposePeer(peerId));
+    }
+  }
+
+  Future<void> _challengePeer(_CameraPeer peer, ParentJoinAuth parentAuth) async {
+    final engine = _authEngine;
+    if (engine == null) {
+      // No keypair available — cannot authenticate a trusted join.
+      peer.transport.send({
+        'type': 'error',
+        'code': 'NOT_TRUSTED',
+        'peerId': peer.peerId,
+        'message': 'Authentication unavailable',
+      });
+      await _disposePeer(peer.peerId);
+      return;
+    }
+    peer.awaitingAuth = true;
     try {
-      // ICE servers fetched per join; falls back to STUN-only (NTR3/§6).
-      final iceServers = await _api.fetchIceConfig();
+      final challenge =
+          await engine.buildChallenge(parentAuth: parentAuth, peerId: peer.peerId);
+      if (_peers[peer.peerId] != peer) return; // left mid-handshake
+      peer.transport.send({'type': 'auth-challenge', ...challenge.toJson()});
+    } catch (e) {
+      debugPrint('CameraSession: buildChallenge(${peer.peerId}) failed: $e');
+    }
+  }
+
+  Future<void> _onAuthResponse(Map<String, dynamic> msg) async {
+    final peerId = msg['peerId'];
+    final deviceId = msg['deviceId'];
+    final pk = msg['pk'];
+    final sig = msg['sig'];
+    if (peerId is! String ||
+        deviceId is! String ||
+        pk is! String ||
+        sig is! String) {
+      return;
+    }
+    final peer = _peers[peerId];
+    final engine = _authEngine;
+    if (peer == null || engine == null || !peer.awaitingAuth) return;
+    final nonce = engine.issuedNonceFor(peerId);
+    if (nonce == null) {
+      await _rejectPeer(peer, 'stale challenge');
+      return;
+    }
+    final verdict = await engine.verifyAuthResponse(
+      response:
+          AuthResponse(peerId: peerId, deviceId: deviceId, pk: pk, sig: sig),
+      nonceIssued: nonce,
+      trustedPkLookup: (id) => _trust?.trustedPk(id),
+    );
+    if (_peers[peerId] != peer) return; // left mid-verify
+    if (verdict == AuthVerdict.authenticated) {
+      peer.awaitingAuth = false;
+      peer.deviceId = deviceId;
+      await _startOffer(peerId);
+    } else {
+      debugPrint('CameraSession: auth failed for $peerId: $verdict');
+      await _rejectPeer(peer, 'not a trusted device');
+    }
+  }
+
+  Future<void> _rejectPeer(_CameraPeer peer, String message) async {
+    peer.transport.send({
+      'type': 'error',
+      'code': 'NOT_TRUSTED',
+      'peerId': peer.peerId,
+      'message': message,
+    });
+    await _disposePeer(peer.peerId);
+  }
+
+  Future<void> _startOffer(String peerId) async {
+    final peer = _peers[peerId];
+    if (peer == null) return;
+    try {
+      // LAN peers share a subnet: host candidates suffice, so skip the
+      // ICE-config fetch entirely (NTR7). Cloud peers may need STUN/TURN.
+      final iceServers = peer.transport.name == 'lan'
+          ? const <Map<String, dynamic>>[]
+          : await _api.fetchIceConfig();
       final pc = await createPeerConnection({'iceServers': iceServers});
       if (_peers[peerId] != peer) {
         // Peer left (or rejoined) while we were setting up.
@@ -314,7 +554,7 @@ class CameraSession {
 
       pc.onIceCandidate = (candidate) {
         if (candidate.candidate == null) return;
-        _signaling.send({
+        peer.transport.send({
           'type': 'ice',
           'peerId': peerId,
           'candidate': {
@@ -348,21 +588,21 @@ class CameraSession {
       );
 
       // Health channel: ordered + reliable (§4 — defaults give reliability).
-      final channel =
-          await pc.createDataChannel('health', RTCDataChannelInit()..ordered = true);
+      final channel = await pc.createDataChannel(
+          'health', RTCDataChannelInit()..ordered = true);
       peer.channel = channel;
       channel.onMessage = (message) => _onChannelMessage(peerId, message);
 
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      _signaling.send({
+      peer.transport.send({
         'type': 'offer',
         'peerId': peerId,
         'sdp': offer.sdp,
         'sdpType': 'offer',
       });
     } catch (e) {
-      debugPrint('CameraSession: creating peer $peerId failed: $e');
+      debugPrint('CameraSession: starting offer for $peerId failed: $e');
     }
   }
 
@@ -398,14 +638,15 @@ class CameraSession {
 
   /// Parent detected FROZEN (F5) — ICE restart + new offer for that peer.
   Future<void> _restartIce(String peerId) async {
-    final pc = _peers[peerId]?.pc;
-    if (pc == null) return;
+    final peer = _peers[peerId];
+    final pc = peer?.pc;
+    if (peer == null || pc == null) return;
     _log?.logEvent(
         SleepEvent(type: 'freeze', at: _now(), data: {'peerId': peerId}));
     try {
       final offer = await pc.createOffer({'iceRestart': true});
       await pc.setLocalDescription(offer);
-      _signaling.send({
+      peer.transport.send({
         'type': 'offer',
         'peerId': peerId,
         'sdp': offer.sdp,
@@ -435,19 +676,26 @@ class CameraSession {
     final ts = _now().millisecondsSinceEpoch;
     final level = _noiseMonitor?.lastLevel ?? 0.0;
     final channelMsg = {'t': 'hb', 'seq': _hbSeq, 'ts': ts, 'audioLevel': level};
-    var needFallback = false;
+    // §2.3: fall back to signaling relay per transport whose peers lack an open
+    // data channel (each transport fans out to its own parents).
+    final fallbackTx = <String, _CameraTransport>{};
     for (final peer in _peers.values) {
       if (peer.channelOpen) {
         _channelSend(peer.channel, channelMsg);
       } else {
-        needFallback = true;
+        fallbackTx[peer.transport.name] = peer.transport;
       }
     }
-    // §2.3: signaling relay when a data channel is not open (server fans out
-    // to all parents; duplicates are harmless — same seq).
-    if (needFallback) {
-      _signaling.send(
-          {'type': 'hb', 'seq': _hbSeq, 'ts': ts, 'audioLevel': level});
+    if (fallbackTx.isNotEmpty) {
+      final sigMsg = {
+        'type': 'hb',
+        'seq': _hbSeq,
+        'ts': ts,
+        'audioLevel': level
+      };
+      for (final tx in fallbackTx.values) {
+        tx.send(sigMsg);
+      }
     }
   }
 
@@ -479,15 +727,41 @@ class CameraSession {
     for (final peer in _peers.values) {
       _channelSend(peer.channel, channelMsg);
     }
-    // Always also via signaling (§2.3) — parents dedupe on ts.
-    _signaling.send({'type': 'noise', 'ts': ts, 'audioLevel': level});
+    // Always also via signaling (§2.3) on every transport — parents dedupe on ts.
+    final sigMsg = {'type': 'noise', 'ts': ts, 'audioLevel': level};
+    _lanTx?.send(sigMsg);
+    _cloudTx?.send(sigMsg);
     _log?.logEvent(
         SleepEvent(type: 'noise', at: _now(), data: {'audioLevel': level}));
+  }
+
+  /// Drops any live peer whose device was revoked from the trust store (F12).
+  void _enforceTrust() {
+    final trust = _trust;
+    if (trust == null) return;
+    for (final peer in _peers.values.toList()) {
+      final deviceId = peer.deviceId;
+      if (deviceId != null && !trust.isTrusted(deviceId)) {
+        final drop = peer.transport.dropPeer;
+        if (drop != null) {
+          unawaited(drop(peer.peerId));
+        } else {
+          peer.transport.send({
+            'type': 'error',
+            'code': 'NOT_TRUSTED',
+            'peerId': peer.peerId,
+            'message': 'This device was removed',
+          });
+        }
+        unawaited(_disposePeer(peer.peerId));
+      }
+    }
   }
 
   Future<void> _disposePeer(String peerId) async {
     final peer = _peers.remove(peerId);
     if (peer == null) return;
+    _authEngine?.forgetPeer(peerId);
     _emitParentCount();
     try {
       await peer.channel?.close();
@@ -511,11 +785,25 @@ class CameraSession {
 
     _log?.logSessionEnd();
 
+    await stopPairing();
+    await _trustSub?.cancel();
+    _trustSub = null;
+
+    // LAN transport teardown (golden path).
+    await _lanMsgSub?.cancel();
+    _lanMsgSub = null;
+    await _discovery.stopAdvertising();
+    await _lan?.stop();
+    _lan = null;
+    _lanTx = null;
+
+    // Cloud transport teardown.
     _signaling.send({'type': 'leave'});
-    await _msgSub?.cancel();
-    _msgSub = null;
-    await _connSub?.cancel();
-    _connSub = null;
+    await _cloudMsgSub?.cancel();
+    _cloudMsgSub = null;
+    await _cloudConnSub?.cancel();
+    _cloudConnSub = null;
+    _cloudTx = null;
     await _signaling.close();
 
     for (final peerId in _peers.keys.toList()) {
@@ -544,6 +832,7 @@ class CameraSession {
     await _prefs.clearCameraRoom();
     _roomId = null;
     _reclaimToken = null;
+    _authEngine = null;
     _sessionLogged = false;
     _hbSeq = 0;
   }
@@ -551,6 +840,7 @@ class CameraSession {
   /// [stop] plus stream-controller teardown. The session is unusable after.
   Future<void> dispose() async {
     await stop();
+    await _discovery.dispose();
     await _warnings.close();
     await _talk.close();
     await _parentCount.close();
@@ -576,15 +866,27 @@ class ParentSession {
     SignalingClient? signaling,
     ApiClient? api,
     SettingsService? settings,
+    CryptoService? crypto,
+    TrustService? trust,
+    DiscoveryService? discovery,
+    String? cameraDeviceId,
     HealthMonitor? healthMonitor,
     BackoffScheduler? backoff,
     DateTime Function() now = DateTime.now,
-  })  : _signaling = signaling ?? SignalingClient(),
-        _api = api ?? ApiClient(),
+  })  : _api = api ?? ApiClient(),
         _settings = settings,
+        _crypto = crypto,
+        _trust = trust,
+        _discovery = discovery ?? DiscoveryService(),
+        _cameraDeviceId = cameraDeviceId,
         _backoff = backoff ?? BackoffScheduler(),
         _now = now,
         healthMonitor = healthMonitor ?? HealthMonitor(now: now) {
+    _signaling = signaling ??
+        SignalingClient(
+          lanCandidates: _lanCandidates,
+          discoverLan: _discoverLanUrls,
+        );
     _freezeDetector = FreezeDetector(
       onFrozen: _onFrozen,
       onRecovered: _onFreezeRecovered,
@@ -598,11 +900,19 @@ class ParentSession {
     });
   }
 
-  final SignalingClient _signaling;
+  late final SignalingClient _signaling;
   final ApiClient _api;
   final SettingsService? _settings;
+  final DiscoveryService _discovery;
+  final String? _cameraDeviceId;
   final BackoffScheduler _backoff;
   final DateTime Function() _now;
+
+  CryptoService? _crypto;
+  TrustService? _trust;
+  AuthEngine? _authEngine;
+  String? _myNonce;
+  bool _securityAlerted = false;
 
   /// The F3 FSM. Bind its [HealthMonitor.states] to the UI.
   final HealthMonitor healthMonitor;
@@ -619,6 +929,8 @@ class ParentSession {
       StreamController<NoiseAlert>.broadcast();
   final StreamController<int> _retryCountdown = StreamController<int>.broadcast();
   final StreamController<int> _latencies = StreamController<int>.broadcast();
+  final StreamController<String> _securityAlerts =
+      StreamController<String>.broadcast();
   final Set<int> _seenNoiseTs = <int>{};
 
   RTCPeerConnection? _pc;
@@ -663,6 +975,13 @@ class ParentSession {
   /// "Reconnecting in Ns" banner (F4).
   Stream<int> get nextRetrySeconds => _retryCountdown.stream;
 
+  /// The transport currently carrying signaling (`'lan'`|`'cloud'`|`'none'`).
+  Stream<String> get transport => _signaling.transport;
+
+  /// Fired when the camera's key no longer matches the trusted one (§8.2) —
+  /// the UI must show a hard "re-pair" alert (possible MITM / reinstall).
+  Stream<String> get securityAlerts => _securityAlerts.stream;
+
   /// Stream latency measured at connect: heartbeat `ts` vs local clock,
   /// clamped >= 0 (F1 — alert when it exceeds [AppConfig.latencyAlertMs]).
   /// Note: clock skew between the two phones biases this measurement; it is
@@ -679,10 +998,73 @@ class ParentSession {
 
   String? get peerId => _peerId;
 
+  /// Whether this session authenticates with device keys. True only for an
+  /// explicit, trusted target camera (the "tap a paired camera" path) — a bare
+  /// code-typed join stays a guest (§8.2 bottom) even when other cameras are
+  /// trusted, so it never false-alarms on an unrelated camera's key.
+  bool get _trustedMode {
+    final target = _cameraDeviceId;
+    final trust = _trust;
+    return _authEngine != null &&
+        target != null &&
+        trust != null &&
+        trust.isTrusted(target);
+  }
+
+  /// Wires the keypair + trust store if they are available; silently stays in
+  /// guest mode otherwise.
+  void _ensureAuth() {
+    if (_authEngine != null) return;
+    try {
+      final crypto = _crypto ??= CryptoService.instance;
+      _trust ??= TrustService.instance;
+      _authEngine = AuthEngine(
+        sign: crypto.signer,
+        verify: crypto.verifier,
+        randomBytes: _secureRandomBytes,
+        identity: crypto.identity(_prefs.deviceName),
+      );
+    } catch (_) {
+      // CryptoService/TrustService not loaded — guest mode only.
+    }
+  }
+
+  List<String> _lanCandidates() {
+    final urls = <String>[];
+    final target = _cameraDeviceId;
+    if (target != null) {
+      final address = _prefs.lastLanAddress(target);
+      if (address != null) urls.add(address);
+      return urls;
+    }
+    final trust = _trust;
+    if (trust != null) {
+      for (final camera in trust.cameras) {
+        final address = _prefs.lastLanAddress(camera.deviceId);
+        if (address != null) urls.add(address);
+      }
+    }
+    return urls;
+  }
+
+  Future<List<String>> _discoverLanUrls() async {
+    final cameras = await _discovery.discover();
+    final urls = <String>[];
+    for (final camera in cameras) {
+      // Remember the address so the next connect tries it first (§7 step 1).
+      unawaited(_prefs.setLastLanAddress(camera.deviceId, camera.wsUrl));
+      if (_cameraDeviceId == null || camera.deviceId == _cameraDeviceId) {
+        urls.add(camera.wsUrl);
+      }
+    }
+    return urls;
+  }
+
   /// Joins [roomId] and keeps the session healthy until [leave].
   Future<void> join(String roomId) async {
     if (_left) return; // a session object is single-use after leave()
     _roomId = roomId;
+    _ensureAuth();
 
     _msgSub ??= _signaling.messages.listen(_onSignal);
     _connSub ??= _signaling.connected.listen((up) {
@@ -712,11 +1094,18 @@ class ParentSession {
     // Rejoin with the previous peerId so the camera replaces the right PC.
     final reusePeerId = _peerId ??
         (_prefs.lastJoinedRoom == roomId ? _prefs.lastPeerId : null);
-    _signaling.send({
+    final message = <String, dynamic>{
       'type': 'join-room',
       'roomId': roomId,
       'peerId': ?reusePeerId,
-    });
+    };
+    if (_trustedMode) {
+      // Fresh challenge for the camera each connection (§8.2 step 1).
+      final auth = _authEngine!.makeParentJoinAuth();
+      _myNonce = auth.nonce;
+      message['auth'] = auth.toJson();
+    }
+    _signaling.send(message);
     // If no room-joined lands, allow another request later.
     Timer(const Duration(seconds: 10), () {
       if (!_joinedRoom) _joinInFlight = false;
@@ -728,6 +1117,8 @@ class ParentSession {
       switch (msg['type']) {
         case 'room-joined':
           _onRoomJoined(msg);
+        case 'auth-challenge':
+          unawaited(_onAuthChallenge(msg));
         case 'offer':
           final sdp = msg['sdp'];
           if (sdp is String) unawaited(_onOffer(sdp));
@@ -748,14 +1139,67 @@ class ParentSession {
             _onNoiseMessage(ts.toInt(), level.toDouble());
           }
         case 'error':
-          debugPrint(
-              'ParentSession: signaling error ${msg['code']}: ${msg['message']}');
+          _onSignalError(msg);
         default:
           break; // unknown types ignored (§2)
       }
     } catch (e) {
       debugPrint('ParentSession: signal ${msg['type']} failed: $e');
     }
+  }
+
+  void _onSignalError(Map<String, dynamic> msg) {
+    final code = msg['code'];
+    debugPrint('ParentSession: signaling error $code: ${msg['message']}');
+    if (code == 'NOT_TRUSTED') {
+      // The camera rejected this device (revoked, or code-joins disabled).
+      _joinInFlight = false;
+      if (!_securityAlerts.isClosed) {
+        _securityAlerts.add(
+            'This device is not allowed to watch. Pair it with the camera '
+            'or ask for the room code.');
+      }
+    }
+  }
+
+  Future<void> _onAuthChallenge(Map<String, dynamic> msg) async {
+    final engine = _authEngine;
+    final trust = _trust;
+    final myNonce = _myNonce;
+    final peerId = msg['peerId'];
+    final nonce = msg['nonce'];
+    final sig = msg['sig'];
+    if (engine == null ||
+        trust == null ||
+        myNonce == null ||
+        peerId is! String ||
+        nonce is! String ||
+        sig is! String) {
+      return;
+    }
+    final trustedPk =
+        _cameraDeviceId == null ? null : trust.trustedPk(_cameraDeviceId);
+    if (trustedPk == null) return; // not in trusted mode for a known camera
+    final challenge = AuthChallenge(peerId: peerId, nonce: nonce, sig: sig);
+    final verified = await engine.verifyCameraChallenge(
+      challenge: challenge,
+      myNonce: myNonce,
+      trustedCameraPk: trustedPk,
+    );
+    if (!verified) {
+      // §8.2 step 2: the camera key changed — disconnect + hard alert (MITM /
+      // reinstall). Deduped so a reconnect loop does not spam the user.
+      if (!_securityAlerted) {
+        _securityAlerted = true;
+        if (!_securityAlerts.isClosed) {
+          _securityAlerts.add(
+              'Camera identity changed — re-pair to continue watching.');
+        }
+      }
+      return; // do not answer the challenge
+    }
+    final response = await engine.buildAuthResponse(challenge: challenge);
+    _signaling.send({'type': 'auth-response', ...response.toJson()});
   }
 
   void _onRoomJoined(Map<String, dynamic> msg) {
@@ -796,14 +1240,13 @@ class ParentSession {
       _drainPendingCandidates();
 
       // Push-to-talk mic (F6): audio-only, muted until setTalking(true).
-      final mic = _micStream ??=
-          await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+      final mic = _micStream ??= await navigator.mediaDevices
+          .getUserMedia({'audio': true, 'video': false});
       for (final track in mic.getAudioTracks()) {
         track.enabled = _talking;
       }
       final senders = await pc.getSenders();
-      final hasAudioSender =
-          senders.any((s) => s.track?.kind == 'audio');
+      final hasAudioSender = senders.any((s) => s.track?.kind == 'audio');
       if (!hasAudioSender) {
         for (final track in mic.getAudioTracks()) {
           await pc.addTrack(track, mic);
@@ -824,7 +1267,12 @@ class ParentSession {
   }
 
   Future<RTCPeerConnection> _createPc() async {
-    final iceServers = await _api.fetchIceConfig(); // STUN-only fallback (§6)
+    // On a LAN transport, host candidates suffice on the shared subnet — skip
+    // the ICE-config fetch entirely (NTR7). Cloud sessions fetch STUN/TURN
+    // (STUN-only fallback, §6).
+    final iceServers = _signaling.activeTransport == 'lan'
+        ? const <Map<String, dynamic>>[]
+        : await _api.fetchIceConfig();
     final pc = await createPeerConnection({'iceServers': iceServers});
     _pc = pc;
     _remoteDescriptionSet = false;
@@ -1032,6 +1480,7 @@ class ParentSession {
       _joinedRoom = false;
       _joinInFlight = false;
       if (!_signaling.isConnected) {
+        // Re-runs the full LAN→cloud order (§7) on every attempt.
         await _signaling.connect();
         if (!_signaling.isConnected) return false; // its own backoff runs
       }
@@ -1051,6 +1500,7 @@ class ParentSession {
   Future<void> manualReconnect() async {
     if (_left) return;
     _backoff.reset();
+    _securityAlerted = false; // allow a fresh identity check after re-pairing
     healthMonitor.manualReset();
     _immediateRetry = true;
     _startReconnect('manual');
@@ -1074,6 +1524,7 @@ class ParentSession {
     await _connSub?.cancel();
     _connSub = null;
     await _signaling.close();
+    await _discovery.dispose();
 
     await _disposePc();
 
@@ -1095,6 +1546,7 @@ class ParentSession {
     await _noiseAlerts.close();
     await _retryCountdown.close();
     await _latencies.close();
+    await _securityAlerts.close();
   }
 
   Future<void> _disposePc() async {

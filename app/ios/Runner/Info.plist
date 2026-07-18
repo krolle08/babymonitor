@@ -30,6 +30,12 @@
 	<string>Streams video of your baby to the parent devices.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Streams sound from the baby&#39;s room and enables push-to-talk.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Finds your baby monitor camera on the home network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_babymonitor._tcp</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

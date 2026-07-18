@@ -9,12 +9,18 @@ import 'package:flutter/material.dart';
 import 'screens/camera_screen.dart';
 import 'screens/parent_screen.dart';
 import 'screens/role_picker_screen.dart';
+import 'services/crypto_service.dart';
 import 'services/notification_service.dart';
 import 'services/settings_service.dart';
+import 'services/trust_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await SettingsService.load();
+  // Device identity + trust store for LAN pairing/auth (F11/F12). The keypair
+  // is generated on first run and persisted in secure storage (§8).
+  await CryptoService.load();
+  await TrustService.load();
   await NotificationService.instance.init();
   runApp(const BabyMonitorApp());
 }

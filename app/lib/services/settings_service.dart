@@ -51,6 +51,9 @@ class SettingsService {
   static const _kReclaimToken = 'reclaimToken';
   static const _kLastJoinedRoom = 'lastJoinedRoom';
   static const _kLastPeerId = 'lastPeerId';
+  static const _kAllowCodeJoins = 'allowCodeJoins';
+  static const _kDeviceName = 'deviceName';
+  static const _kLanAddrPrefix = 'lanAddr:'; // + camera deviceId
 
   static String _generateDeviceId() {
     final rng = Random.secure();
@@ -152,4 +155,39 @@ class SettingsService {
     await _prefs.remove(_kLastJoinedRoom);
     await _prefs.remove(_kLastPeerId);
   }
+
+  // --- Trust / LAN identity (F11/F12, PROTOCOL §7, §8) ---
+
+  /// Whether guests may join by typing the room code (§8.2 bootstrap). Default
+  /// on (NTR2). Trusted devices never need the code regardless of this.
+  bool get allowCodeJoins => _prefs.getBool(_kAllowCodeJoins) ?? true;
+
+  Future<void> setAllowCodeJoins(bool value) =>
+      _prefs.setBool(_kAllowCodeJoins, value);
+
+  /// This device's human-readable pairing name (shown in the peer's trust list
+  /// and in the QR/mDNS TXT). Defaults to `Camera <id>` / `Parent <id>` using
+  /// the last 4 hex of [deviceId] so two phones in a house are distinguishable.
+  String get deviceName {
+    final stored = _prefs.getString(_kDeviceName);
+    if (stored != null && stored.trim().isNotEmpty) return stored.trim();
+    final suffix = deviceId.substring(deviceId.length - 4);
+    final base = role == 'camera' ? 'Camera' : 'Parent';
+    return '$base $suffix';
+  }
+
+  Future<void> setDeviceName(String value) =>
+      _prefs.setString(_kDeviceName, value.trim());
+
+  /// Last LAN `ws://host:port/ws` address seen for a trusted camera, tried
+  /// first on connect/reconnect (§7 connection order). Keyed by camera
+  /// deviceId so multiple cameras are remembered independently.
+  String? lastLanAddress(String cameraDeviceId) =>
+      _prefs.getString('$_kLanAddrPrefix$cameraDeviceId');
+
+  Future<void> setLastLanAddress(String cameraDeviceId, String address) =>
+      _prefs.setString('$_kLanAddrPrefix$cameraDeviceId', address);
+
+  Future<void> clearLastLanAddress(String cameraDeviceId) =>
+      _prefs.remove('$_kLanAddrPrefix$cameraDeviceId');
 }

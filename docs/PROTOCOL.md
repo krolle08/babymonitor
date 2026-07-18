@@ -227,18 +227,25 @@ The camera app embeds its own WebSocket signaling endpoint so that pairing and
 - **Discovery:** mDNS/DNS-SD service type **`_babymonitor._tcp`**, instance name = the
   camera's display name, TXT records: `id` (deviceId), `name`, `proto=1`, `port`.
 - **Protocol:** identical JSON messages to §2 with these deltas:
-  - There is exactly one implicit room. Parents send `join-room` with `roomId: "LOCAL"`;
-    `create-room` is not used (the camera *is* the room). All other flows (`offer`,
-    `answer`, `ice`, `ice-restart`, `hb`, `noise`, `auth-*`, capacity, `peer-left`)
-    behave exactly as in §2 with the camera playing the server role.
+  - There is exactly one implicit room; `create-room` is not used (the camera *is* the
+    room). `join-room` accepts two `roomId` forms: **`"LOCAL"`** (trusted join — must
+    carry `auth`, §8.2) or **the current room code** (guest bootstrap, see below). All
+    other flows (`offer`, `answer`, `ice`, `ice-restart`, `hb`, `noise`, `auth-*`,
+    capacity, `peer-left`) behave exactly as in §2 with the camera playing the server
+    role.
   - `pair-request`/`pair-response` (§8.1) are accepted **only** on this transport.
 - **Parent connection order** (every initial connect *and* every reconnect attempt):
   1. last-known LAN address of a trusted camera → 2. mDNS discovery (2 s budget) →
   3. cloud signaling (§2). First success wins; the order guarantees the same-network
   case never depends on the internet.
 - Untrusted `join-room` on the LAN transport is rejected with `NOT_TRUSTED` unless the
-  camera has pairing mode active (§8.1) or the join carries the current room code shown
-  on the camera screen (guest bootstrap, same as cloud).
+  camera has pairing mode active (§8.1) or the join uses the current room code as its
+  `roomId` (guest bootstrap, same as cloud, gated by "allow room-code joins").
+- **Code provenance:** the 6-char room code is minted by the *cloud* server
+  (`room-created`); the camera reuses it for LAN guest joins. A camera with no cloud
+  connectivity therefore has **no guest code** — fully-offline LAN access is for
+  trusted devices (§8.2) or via pairing mode (§8.1). *(Future option, not implemented:
+  camera-minted local codes.)*
 
 ## 8. Device identity & trust (F12)
 
@@ -282,9 +289,19 @@ Sequence per parent join (camera drives it; the cloud server just relays §2.2):
    → proceeds with the `offer` (§2.2). Otherwise → `error {code: NOT_TRUSTED}` to that
    peer and drops it.
 
+**Signature byte layout (normative for any future client):** all signed material is a
+concatenation of UTF-8 strings — nonces are signed as their **base64url string form**,
+not decoded bytes. Concretely: `auth-challenge.sig` signs
+`utf8(nonce_p_base64url) ∥ utf8(peerId)`; `auth-response.sig` signs
+`utf8(nonce_c_base64url) ∥ utf8(peerId)`; `pair-request.proof` signs
+`utf8(token) ∥ utf8(deviceId_parent)`.
+
 Guest mode (bootstrap, NTR2): a `join-room` **without** `auth` is served only when the
 camera's "allow room-code joins" setting is on (default **on**) — the room code typed by
-the guest is the authorization. Trusted devices never need the code.
+the guest is the authorization. Trusted devices never need to *see or type* a code; note
+that on the **cloud** transport rooms are still code-addressed, so the parent app
+remembers the last room code per trusted camera and supplies it silently — the trust
+guarantee is "zero input", not "code-free wire format".
 
 ## 9. Golden path — monitoring never depends on the server (NTR7)
 
