@@ -1,0 +1,17 @@
+{
+  "name": "babymonitor-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Baby monitor signaling (WebSocket) + sleep-log REST API (SQLite). Wire contract: docs/PROTOCOL.md.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

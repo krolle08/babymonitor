@@ -1,6 +1,20 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- TR6 / F1: WebRTC streaming needs network + camera + microphone. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- F6: push-to-talk audio routing on the camera device. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- F4: reconnect logic observes connectivity changes. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- F2 / TR6: camera device must stay alive while screen-locked. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- F7: noise alerts as local notifications (Android 13+). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- WebRTC audio over Bluetooth headsets (Android 12+). -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <application
-        android:label="babymonitor"
+        android:label="Baby Monitor"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
