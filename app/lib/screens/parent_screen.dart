@@ -1,11 +1,13 @@
-/// Parent-unit screen (spec F1/F3–F7, docs/PROTOCOL.md §5.4).
+/// Parent-unit screen (spec F1/F3–F7, F11/F12, docs/PROTOCOL.md §5.4, §7, §8).
 ///
-/// Join flow (6-char code, last room prefilled — NTR2), full-screen stream,
-/// health badge (F3: DEGRADED shows only as a badge color change), reconnect
-/// banner with live countdown (F4), frozen alert + failed overlay with a
-/// manual reconnect (F5/F3), hold-to-talk (F6), latency chip (F1) and noise
-/// alerts — in-app snackbar when foregrounded, local notification when
-/// backgrounded (F7 / AT-09).
+/// Pre-join is a **camera picker**: trusted cameras (F12) that connect with zero
+/// input, marked "nearby" when mDNS finds them on this network (F11), plus a
+/// "Join with a code" fallback for guests (NTR2). Watching shows the full-screen
+/// stream, health badge (F3), reconnect banner (F4), frozen/failed overlays
+/// (F5/F3), hold-to-talk (F6), latency chip (F1), a quiet LAN/cloud transport
+/// badge (§7) and noise alerts — snackbar when foregrounded, notification when
+/// backgrounded (F7 / AT-09). A camera-key mismatch raises a blocking security
+/// alert that disconnects on dismiss (§8.2).
 library;
 
 import 'dart:async';
@@ -16,20 +18,32 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../config/app_config.dart';
 import '../core/health_state.dart';
+import '../core/identity.dart';
+import '../services/discovery_service.dart';
 import '../services/notification_service.dart';
 import '../services/settings_service.dart';
+import '../services/trust_service.dart';
 import '../services/webrtc_service.dart';
 import '../widgets/health_badge.dart';
 import '../widgets/ptt_button.dart';
 import '../widgets/reconnect_banner.dart';
+import '../widgets/security_alert_listener.dart';
 import 'history_screen.dart';
 import 'settings_screen.dart';
+import 'trusted_devices_screen.dart';
 
 class ParentScreen extends StatefulWidget {
-  const ParentScreen({super.key, required this.onSwitchRole});
+  const ParentScreen({
+    super.key,
+    required this.onSwitchRole,
+    this.discoverCameras,
+  });
 
   /// "Switch role" escape hatch — the host shows the role picker.
   final VoidCallback onSwitchRole;
+
+  /// Test seam: how to enumerate nearby cameras. Defaults to real mDNS.
+  final Future<List<DiscoveredCamera>> Function()? discoverCameras;
 
   @override
   State<ParentScreen> createState() => _ParentScreenState();
@@ -37,6 +51,9 @@ class ParentScreen extends StatefulWidget {
 
 class _ParentScreenState extends State<ParentScreen>
     with WidgetsBindingObserver {
+  /// Implicit LAN room for a trusted, zero-input connect (§7).
+  static const String _trustedRoomId = 'LOCAL';
+
   late final TextEditingController _codeController;
   final RTCVideoRenderer _renderer = RTCVideoRenderer();
   final List<StreamSubscription<dynamic>> _subs = [];
@@ -49,8 +66,12 @@ class _ParentScreenState extends State<ParentScreen>
   HealthState _health = HealthState.connecting;
   int? _retrySeconds;
   int? _latencyMs;
-  String _roomCode = '';
+  String _transport = 'none';
+  String _roomLabel = '';
   AppLifecycleState _lifecycle = AppLifecycleState.resumed;
+
+  Set<String> _nearby = {};
+  bool _scanningNearby = false;
 
   @override
   void initState() {
@@ -58,9 +79,11 @@ class _ParentScreenState extends State<ParentScreen>
     WidgetsBinding.instance.addObserver(this);
     _lifecycle =
         WidgetsBinding.instance.lifecycleState ?? AppLifecycleState.resumed;
+    final last = SettingsService.instance.lastJoinedRoom;
     _codeController = TextEditingController(
-      text: SettingsService.instance.lastJoinedRoom ?? '',
+      text: (last != null && last.length == 6) ? last : '',
     );
+    unawaited(_refreshNearby());
   }
 
   @override
@@ -72,31 +95,79 @@ class _ParentScreenState extends State<ParentScreen>
 
   bool get _canJoin => _codeController.text.trim().length == 6 && !_joining;
 
+  // --- Nearby discovery (F11) ---
+
+  Future<List<DiscoveredCamera>> _defaultDiscover() async {
+    final service = DiscoveryService();
+    try {
+      return await service.discover();
+    } finally {
+      await service.dispose();
+    }
+  }
+
+  Future<void> _refreshNearby() async {
+    if (_scanningNearby) return;
+    setState(() => _scanningNearby = true);
+    final discover = widget.discoverCameras ?? _defaultDiscover;
+    List<DiscoveredCamera> cameras;
+    try {
+      cameras = await discover();
+    } catch (_) {
+      cameras = const [];
+    }
+    if (!mounted) return;
+    setState(() {
+      _nearby = {for (final c in cameras) c.deviceId};
+      _scanningNearby = false;
+    });
+  }
+
+  // --- Session lifecycle ---
+
+  Future<void> _connectToCamera(TrustedDevice camera) async {
+    if (_joining || _inRoom) return;
+    await _startSession(
+      ParentSession(cameraDeviceId: camera.deviceId),
+      _trustedRoomId,
+      camera.name,
+    );
+  }
+
   Future<void> _join() async {
     final code = _codeController.text.trim().toUpperCase();
     if (code.length != 6 || _joining || _inRoom) return;
+    await _startSession(ParentSession(), code, 'Room $code');
+  }
+
+  Future<void> _startSession(
+    ParentSession session,
+    String roomId,
+    String label,
+  ) async {
     setState(() => _joining = true);
-    // Noise alerts must reach a backgrounded parent (AT-09) — ask now, at
-    // the moment the user starts monitoring.
+    // Noise alerts must reach a backgrounded parent (AT-09) — ask now, at the
+    // moment the user starts monitoring.
     unawaited(NotificationService.instance.requestPermissions());
     if (!_rendererReady) {
       await _renderer.initialize();
       _rendererReady = true;
     }
-    final session = ParentSession();
     _session = session;
     _health = session.healthMonitor.state;
+    _transport = 'none';
     _subs.add(session.healthStates.listen(_onHealth));
     _subs.add(session.remoteStreams.listen(_onRemoteStream));
     _subs.add(session.nextRetrySeconds.listen(_onRetryCountdown));
     _subs.add(session.latencies.listen(_onLatency));
     _subs.add(session.noiseAlerts.listen(_onNoiseAlert));
-    await session.join(code); // never throws (NTR3)
+    _subs.add(session.transport.listen(_onTransport));
+    await session.join(roomId); // never throws (NTR3)
     if (!mounted) return;
     setState(() {
       _joining = false;
       _inRoom = true;
-      _roomCode = code;
+      _roomLabel = label;
     });
   }
 
@@ -127,6 +198,10 @@ class _ParentScreenState extends State<ParentScreen>
     if (mounted) setState(() => _latencyMs = ms);
   }
 
+  void _onTransport(String transport) {
+    if (mounted) setState(() => _transport = transport);
+  }
+
   void _onNoiseAlert(NoiseAlert alert) {
     final percent = (alert.audioLevel.clamp(0.0, 1.0) * 100).round();
     if (_foregrounded) {
@@ -149,7 +224,7 @@ class _ParentScreenState extends State<ParentScreen>
       await sub.cancel();
     }
     _subs.clear();
-    _renderer.srcObject = null;
+    if (_rendererReady) _renderer.srcObject = null;
     if (mounted) {
       setState(() {
         _inRoom = false;
@@ -158,7 +233,9 @@ class _ParentScreenState extends State<ParentScreen>
         _health = HealthState.connecting;
         _retrySeconds = null;
         _latencyMs = null;
+        _transport = 'none';
       });
+      unawaited(_refreshNearby());
     }
     if (session != null) await session.leave();
   }
@@ -173,10 +250,20 @@ class _ParentScreenState extends State<ParentScreen>
     final session = _session;
     _session = null;
     if (session != null) unawaited(session.leave());
-    _renderer.srcObject = null;
+    if (_rendererReady) _renderer.srcObject = null;
     unawaited(_renderer.dispose());
     _codeController.dispose();
     super.dispose();
+  }
+
+  void _openTrustedDevices() {
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute<void>(
+            builder: (_) => const TrustedDevicesScreen(),
+          ),
+        )
+        .then((_) => _refreshNearby());
   }
 
   void _openHistory() {
@@ -193,17 +280,22 @@ class _ParentScreenState extends State<ParentScreen>
 
   @override
   Widget build(BuildContext context) {
-    return _inRoom ? _buildWatch(context) : _buildJoin(context);
+    return _inRoom ? _buildWatch(context) : _buildPicker(context);
   }
 
-  // --- Join flow ---
+  // --- Pre-join: camera picker ---
 
-  Widget _buildJoin(BuildContext context) {
+  Widget _buildPicker(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
         title: const Text('Parent unit'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.devices_outlined),
+            tooltip: 'Trusted devices',
+            onPressed: _openTrustedDevices,
+          ),
           IconButton(
             icon: const Icon(Icons.history),
             tooltip: 'History',
@@ -224,72 +316,24 @@ class _ParentScreenState extends State<ParentScreen>
       body: SafeArea(
         child: Center(
           child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.all(20),
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 420),
+              constraints: const BoxConstraints(maxWidth: 480),
               child: Column(
-                mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Icon(Icons.crib, size: 56, color: theme.colorScheme.primary),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Join the camera',
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.headlineSmall,
+                  StreamBuilder<List<TrustedDevice>>(
+                    stream: TrustService.instance.changes,
+                    initialData: TrustService.instance.devices,
+                    builder: (context, snapshot) {
+                      final cameras = (snapshot.data ?? const <TrustedDevice>[])
+                          .where((d) => d.role == DeviceRole.camera)
+                          .toList();
+                      return _buildCameraSection(theme, cameras);
+                    },
                   ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Enter the 6-character room code shown on the '
-                    'camera phone.',
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.bodyMedium
-                        ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-                  ),
-                  const SizedBox(height: 24),
-                  TextField(
-                    controller: _codeController,
-                    onChanged: (_) => setState(() {}),
-                    onSubmitted: (_) => unawaited(_join()),
-                    textAlign: TextAlign.center,
-                    textCapitalization: TextCapitalization.characters,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    maxLength: 6,
-                    style: const TextStyle(
-                      fontSize: 32,
-                      letterSpacing: 10,
-                      fontWeight: FontWeight.w700,
-                    ),
-                    inputFormatters: [
-                      // Room codes are A–Z / 2–9 (no 0/O/1/I) — PROTOCOL §2.1.
-                      FilteringTextInputFormatter.allow(RegExp('[a-zA-Z2-9]')),
-                      LengthLimitingTextInputFormatter(6),
-                      _UpperCaseTextFormatter(),
-                    ],
-                    decoration: InputDecoration(
-                      counterText: '',
-                      hintText: 'ABC234',
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  FilledButton.icon(
-                    onPressed: _canJoin ? () => unawaited(_join()) : null,
-                    icon: _joining
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.play_arrow_rounded),
-                    label: Text(_joining ? 'Joining…' : 'Watch'),
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                    ),
-                  ),
+                  const SizedBox(height: 28),
+                  _buildCodeSection(theme),
                 ],
               ),
             ),
@@ -299,104 +343,368 @@ class _ParentScreenState extends State<ParentScreen>
     );
   }
 
+  Widget _buildCameraSection(ThemeData theme, List<TrustedDevice> cameras) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Text('Your cameras', style: theme.textTheme.titleMedium),
+            const Spacer(),
+            IconButton(
+              icon: _scanningNearby
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.refresh),
+              tooltip: 'Scan for nearby cameras',
+              onPressed: _scanningNearby ? null : () => unawaited(_refreshNearby()),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        if (cameras.isEmpty)
+          _NoCamerasCard(onAdd: _openTrustedDevices)
+        else
+          ...cameras.map(
+            (camera) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: _CameraTile(
+                camera: camera,
+                nearby: _nearby.contains(camera.deviceId),
+                enabled: !_joining,
+                onTap: () => unawaited(_connectToCamera(camera)),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildCodeSection(ThemeData theme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(child: Divider(color: theme.colorScheme.outlineVariant)),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Text(
+                'Join with a code',
+                style: theme.textTheme.labelMedium
+                    ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+            ),
+            Expanded(child: Divider(color: theme.colorScheme.outlineVariant)),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Enter the 6-character room code shown on the camera phone.',
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _codeController,
+          onChanged: (_) => setState(() {}),
+          onSubmitted: (_) => unawaited(_join()),
+          textAlign: TextAlign.center,
+          textCapitalization: TextCapitalization.characters,
+          autocorrect: false,
+          enableSuggestions: false,
+          maxLength: 6,
+          style: const TextStyle(
+            fontSize: 32,
+            letterSpacing: 10,
+            fontWeight: FontWeight.w700,
+          ),
+          inputFormatters: [
+            // Room codes are A–Z / 2–9 (no 0/O/1/I) — PROTOCOL §2.1.
+            FilteringTextInputFormatter.allow(RegExp('[a-zA-Z2-9]')),
+            LengthLimitingTextInputFormatter(6),
+            _UpperCaseTextFormatter(),
+          ],
+          decoration: InputDecoration(
+            counterText: '',
+            hintText: 'ABC234',
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        FilledButton.icon(
+          onPressed: _canJoin ? () => unawaited(_join()) : null,
+          icon: _joining
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.play_arrow_rounded),
+          label: Text(_joining ? 'Joining…' : 'Watch'),
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 16),
+          ),
+        ),
+      ],
+    );
+  }
+
   // --- Watching ---
 
   Widget _buildWatch(BuildContext context) {
     final theme = Theme.of(context);
-    return Scaffold(
-      backgroundColor: Colors.black,
-      appBar: AppBar(
-        title: Text('Room $_roomCode'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.history),
-            tooltip: 'History',
-            onPressed: _openHistory,
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings_outlined),
-            tooltip: 'Settings',
-            onPressed: _openSettings,
-          ),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Leave room',
-            onPressed: () => unawaited(_leave()),
-          ),
-        ],
-      ),
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          if (_hasVideo)
-            RTCVideoView(
-              _renderer,
-              mirror: false,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-            )
-          else
-            Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const CircularProgressIndicator(),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Connecting to camera…',
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ),
+    final session = _session;
+    final alerts = session?.securityAlerts ?? const Stream<String>.empty();
+    return SecurityAlertListener(
+      alerts: alerts,
+      onDismiss: () => unawaited(_leave()),
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        appBar: AppBar(
+          title: Text(_roomLabel),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.history),
+              tooltip: 'History',
+              onPressed: _openHistory,
             ),
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Row(
-                    children: [
-                      HealthBadge(state: _health),
-                      const Spacer(),
-                      if (_latencyMs != null) _LatencyChip(ms: _latencyMs!),
-                    ],
-                  ),
-                  if (_health == HealthState.reconnecting)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 12),
-                      child: Center(
-                        child: ReconnectBanner(
-                          secondsRemaining: _retrySeconds,
-                          onRetryNow: () =>
-                              unawaited(_session?.manualReconnect()),
-                        ),
+            IconButton(
+              icon: const Icon(Icons.settings_outlined),
+              tooltip: 'Settings',
+              onPressed: _openSettings,
+            ),
+            IconButton(
+              icon: const Icon(Icons.logout),
+              tooltip: 'Leave',
+              onPressed: () => unawaited(_leave()),
+            ),
+          ],
+        ),
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (_hasVideo)
+              RTCVideoView(
+                _renderer,
+                mirror: false,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              )
+            else
+              Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Connecting to camera…',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
-                ],
+                  ],
+                ),
               ),
-            ),
-          ),
-          if (_health == HealthState.frozen) const _FrozenOverlay(),
-          if (_health == HealthState.failed)
-            _FailedOverlay(
-              onReconnect: () => unawaited(_session?.manualReconnect()),
-            ),
-          if (_health != HealthState.failed)
-            Align(
-              alignment: Alignment.bottomCenter,
-              child: SafeArea(
-                child: Padding(
-                  padding: const EdgeInsets.only(bottom: 20),
-                  child: PttButton(
-                    onTalkingChanged: (on) =>
-                        unawaited(_session?.setTalking(on)),
-                  ),
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        HealthBadge(state: _health),
+                        const SizedBox(width: 8),
+                        if (_transport == 'lan' || _transport == 'cloud')
+                          _TransportBadge(transport: _transport),
+                        const Spacer(),
+                        if (_latencyMs != null) _LatencyChip(ms: _latencyMs!),
+                      ],
+                    ),
+                    if (_health == HealthState.reconnecting)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Center(
+                          child: ReconnectBanner(
+                            secondsRemaining: _retrySeconds,
+                            onRetryNow: () =>
+                                unawaited(_session?.manualReconnect()),
+                          ),
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ),
+            if (_health == HealthState.frozen) const _FrozenOverlay(),
+            if (_health == HealthState.failed)
+              _FailedOverlay(
+                onReconnect: () => unawaited(_session?.manualReconnect()),
+              ),
+            if (_health != HealthState.failed)
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.only(bottom: 20),
+                    child: PttButton(
+                      onTalkingChanged: (on) =>
+                          unawaited(_session?.setTalking(on)),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// A tappable trusted camera; "nearby" badge when mDNS found it (F11/F12).
+class _CameraTile extends StatelessWidget {
+  const _CameraTile({
+    required this.camera,
+    required this.nearby,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  final TrustedDevice camera;
+  final bool nearby;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      child: ListTile(
+        enabled: enabled,
+        onTap: onTap,
+        leading: CircleAvatar(
+          backgroundColor: theme.colorScheme.surfaceContainerHigh,
+          child: Icon(Icons.videocam_outlined,
+              color: theme.colorScheme.primary),
+        ),
+        title: Text(camera.name),
+        subtitle: nearby
+            ? const _NearbyBadge()
+            : Text(
+                'Tap to connect',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+        trailing: const Icon(Icons.play_circle_outline),
+      ),
+    );
+  }
+}
+
+/// Green "nearby" pill shown on a trusted camera mDNS can see (F11).
+class _NearbyBadge extends StatelessWidget {
+  const _NearbyBadge();
+
+  static const Color _green = Color(0xFF10B981);
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: const [
+        Icon(Icons.wifi, size: 14, color: _green),
+        SizedBox(width: 4),
+        Text(
+          'Nearby',
+          style: TextStyle(
+            color: _green,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _NoCamerasCard extends StatelessWidget {
+  const _NoCamerasCard({required this.onAdd});
+
+  final VoidCallback onAdd;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            Icon(Icons.videocam_outlined,
+                size: 40, color: theme.colorScheme.onSurfaceVariant),
+            const SizedBox(height: 12),
+            Text('No paired cameras', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 6),
+            Text(
+              'Pair a camera once to watch with a single tap — no code, and no '
+              'internet needed at home.',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              onPressed: onAdd,
+              icon: const Icon(Icons.qr_code_scanner),
+              label: const Text('Add a camera'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Quiet LAN/cloud transport indicator on the live stream (§7).
+class _TransportBadge extends StatelessWidget {
+  const _TransportBadge({required this.transport});
+
+  final String transport;
+
+  @override
+  Widget build(BuildContext context) {
+    final lan = transport == 'lan';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xCC0A101F),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: const Color(0x33FFFFFF)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(lan ? Icons.wifi : Icons.cloud_outlined,
+              size: 14, color: const Color(0xFF93A1BC)),
+          const SizedBox(width: 6),
+          Text(
+            lan ? 'LAN' : 'CLOUD',
+            style: const TextStyle(
+              color: Color(0xFF93A1BC),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.8,
+            ),
+          ),
         ],
       ),
     );

@@ -15,6 +15,8 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 import '../services/settings_service.dart';
 import '../services/sleep_log_service.dart';
 import '../services/webrtc_service.dart';
+import '../widgets/pairing_qr_overlay.dart';
+import 'trusted_devices_screen.dart';
 
 enum _Phase { starting, running, error }
 
@@ -44,6 +46,7 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _stopping = false;
   bool _tornDown = false;
   String _sensitivity = SettingsService.instance.noiseSensitivity;
+  bool _allowCodeJoins = SettingsService.instance.allowCodeJoins;
 
   Timer? _roomPoll;
 
@@ -143,12 +146,32 @@ class _CameraScreenState extends State<CameraScreen> {
     super.dispose();
   }
 
+  void _openTrustedDevices() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => TrustedDevicesScreen(cameraSession: _session),
+      ),
+    );
+  }
+
+  Future<void> _addTrustedDevice() => showPairingOverlay(context, _session);
+
+  Future<void> _setAllowCodeJoins(bool value) async {
+    setState(() => _allowCodeJoins = value);
+    await SettingsService.instance.setAllowCodeJoins(value);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Camera unit'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.devices_outlined),
+            tooltip: 'Trusted devices',
+            onPressed: _phase == _Phase.running ? _openTrustedDevices : null,
+          ),
           IconButton(
             icon: const Icon(Icons.swap_horiz),
             tooltip: 'Switch role',
@@ -277,6 +300,20 @@ class _CameraScreenState extends State<CameraScreen> {
             },
           ),
           const SizedBox(height: 16),
+          OutlinedButton.icon(
+            onPressed: () => unawaited(_addTrustedDevice()),
+            icon: const Icon(Icons.add_link),
+            label: const Text('Add trusted device'),
+            style: OutlinedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 14),
+            ),
+          ),
+          const SizedBox(height: 8),
+          _AllowCodeJoinsTile(
+            value: _allowCodeJoins,
+            onChanged: (value) => unawaited(_setAllowCodeJoins(value)),
+          ),
+          const SizedBox(height: 16),
           FilledButton.icon(
             onPressed: _stopping ? null : () => unawaited(_stop()),
             icon: const Icon(Icons.stop_circle_outlined),
@@ -293,47 +330,89 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 }
 
+/// Camera-only guest-access toggle (§8.2 bootstrap): when off, only paired
+/// devices can watch. Persisted; applies the next time monitoring starts.
+class _AllowCodeJoinsTile extends StatelessWidget {
+  const _AllowCodeJoinsTile({required this.value, required this.onChanged});
+
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      margin: EdgeInsets.zero,
+      child: SwitchListTile(
+        value: value,
+        onChanged: onChanged,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+        title: const Text('Allow room-code joins'),
+        subtitle: Text(
+          value
+              ? 'Guests can watch by typing the room code.'
+              : 'Only paired devices can watch. Applies on next start.',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+      ),
+    );
+  }
+}
+
 class _RoomCodeCard extends StatelessWidget {
   const _RoomCodeCard({required this.roomId});
 
+  /// The cloud room code, or null when the camera has no cloud connection yet
+  /// (fully-offline / local-only mode — F11/NTR7).
   final String? roomId;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final code = roomId;
+    final online = code != null;
     return Card(
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         child: Column(
           children: [
+            Align(
+              alignment: Alignment.centerRight,
+              child: _TransportChip(online: online),
+            ),
             Text(
-              'ROOM CODE',
+              online ? 'ROOM CODE' : 'TRUSTED DEVICES ONLY',
               style: theme.textTheme.labelSmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
                 letterSpacing: 2,
               ),
             ),
             const SizedBox(height: 6),
-            if (code == null)
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+            if (!online)
+              Column(
                 children: [
-                  const SizedBox(
-                    width: 18,
-                    height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  const SizedBox(width: 12),
+                  Icon(Icons.shield_outlined,
+                      size: 36, color: theme.colorScheme.primary),
+                  const SizedBox(height: 6),
                   Text(
-                    'Waiting for the server…',
-                    style: theme.textTheme.bodyMedium?.copyWith(
+                    'Offline — local mode',
+                    style: theme.textTheme.titleMedium?.copyWith(
+                      color: theme.colorScheme.onSurface,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'No cloud code yet. Paired phones on this WiFi can still '
+                    'connect with no internet.',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodySmall?.copyWith(
                       color: theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ],
               )
-            else
+            else ...[
               FittedBox(
                 fit: BoxFit.scaleDown,
                 child: Text(
@@ -346,16 +425,43 @@ class _RoomCodeCard extends StatelessWidget {
                   ),
                 ),
               ),
-            const SizedBox(height: 4),
-            Text(
-              'Parents type this code to watch',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
+              const SizedBox(height: 4),
+              Text(
+                'Parents type this code to watch',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
               ),
-            ),
+            ],
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Quiet cloud-reachability indicator (NTR7): never an alert style — a cloud
+/// outage only removes remote viewing, it is not a monitoring failure.
+class _TransportChip extends StatelessWidget {
+  const _TransportChip({required this.online});
+
+  final bool online;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final color = scheme.onSurfaceVariant;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(online ? Icons.cloud_done_outlined : Icons.cloud_off_outlined,
+            size: 14, color: color),
+        const SizedBox(width: 4),
+        Text(
+          online ? 'online' : 'offline — local mode',
+          style: TextStyle(color: color, fontSize: 11),
+        ),
+      ],
     );
   }
 }

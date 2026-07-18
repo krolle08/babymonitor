@@ -8,6 +8,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../services/settings_service.dart';
+import 'trusted_devices_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -23,9 +24,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _signalingUrl;
   late final TextEditingController _apiBaseUrl;
   late final TextEditingController _familyToken;
+  late final TextEditingController _deviceName;
   late String _sensitivity;
+  late String? _role;
+  late bool _allowCodeJoins;
   bool _obscureToken = true;
   bool _saving = false;
+
+  bool get _isCamera => _role == 'camera';
 
   @override
   void initState() {
@@ -34,7 +40,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _signalingUrl = TextEditingController(text: settings.signalingUrl);
     _apiBaseUrl = TextEditingController(text: settings.apiBaseUrl);
     _familyToken = TextEditingController(text: settings.familyToken);
+    _deviceName = TextEditingController(text: settings.deviceName);
     _sensitivity = settings.noiseSensitivity;
+    _role = settings.role;
+    _allowCodeJoins = settings.allowCodeJoins;
   }
 
   @override
@@ -42,6 +51,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _signalingUrl.dispose();
     _apiBaseUrl.dispose();
     _familyToken.dispose();
+    _deviceName.dispose();
     super.dispose();
   }
 
@@ -63,6 +73,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await settings.setApiBaseUrl(_apiBaseUrl.text.trim());
     await settings.setFamilyToken(_familyToken.text.trim());
     await settings.setNoiseSensitivity(_sensitivity);
+    final name = _deviceName.text.trim();
+    if (name.isNotEmpty) await settings.setDeviceName(name);
+    await settings.setAllowCodeJoins(_allowCodeJoins);
     if (!mounted) return;
     setState(() => _saving = false);
     ScaffoldMessenger.of(context).showSnackBar(
@@ -79,6 +92,63 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
+            const _SectionHeader('Device'),
+            TextFormField(
+              controller: _deviceName,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(
+                labelText: 'Device name',
+                helperText: 'Shown to the other phone when pairing',
+                hintText: 'e.g. Mom’s phone',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Card(
+              child: Column(
+                children: [
+                  ListTile(
+                    leading: Icon(_isCamera
+                        ? Icons.videocam_outlined
+                        : Icons.smartphone),
+                    title: const Text('Role'),
+                    subtitle: Text(_isCamera
+                        ? 'Camera unit'
+                        : _role == 'parent'
+                            ? 'Parent unit'
+                            : 'Not chosen yet'),
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
+                    leading: const Icon(Icons.devices_outlined),
+                    title: const Text('Trusted devices'),
+                    subtitle: const Text('Manage paired phones and cameras'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const TrustedDevicesScreen(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_isCamera) ...[
+              const SizedBox(height: 12),
+              Card(
+                child: SwitchListTile(
+                  value: _allowCodeJoins,
+                  onChanged: (value) =>
+                      setState(() => _allowCodeJoins = value),
+                  title: const Text('Allow room-code joins'),
+                  subtitle: const Text(
+                    'When off, only paired devices can watch — a guessed code '
+                    'is rejected.',
+                  ),
+                ),
+              ),
+            ],
+            const SizedBox(height: 24),
             const _SectionHeader('Server'),
             TextFormField(
               controller: _signalingUrl,
