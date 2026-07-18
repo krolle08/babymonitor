@@ -285,3 +285,93 @@ test('rooms are garbage-collected 10 minutes after both sides are gone', async (
   assert.equal(err.code, 'ROOM_NOT_FOUND');
   parent.close();
 });
+
+// ---- Trusted-device auth relay (docs/PROTOCOL.md §2.1, §2.2, §8.2) ----
+
+test('join-room auth is passed through to the camera inside peer-joined', async () => {
+  const { camera, roomId } = await newRoom();
+  const parent = await WsClient.connect(srv.wsUrl);
+  const auth = { deviceId: 'abcdef0123456789', pk: 'pk-base64url', nonce: 'nonce-base64url' };
+  parent.send({ type: 'join-room', roomId, auth });
+  const joined = await parent.next();
+  assert.equal(joined.type, 'room-joined');
+  const notice = await camera.next();
+  assert.deepEqual(notice, { type: 'peer-joined', peerId: joined.peerId, auth });
+  camera.close();
+  parent.close();
+});
+
+test('join-room without auth yields a peer-joined that omits the auth key', async () => {
+  const { camera, roomId } = await newRoom();
+  const parent = await WsClient.connect(srv.wsUrl);
+  parent.send({ type: 'join-room', roomId });
+  const joined = await parent.next();
+  const notice = await camera.next();
+  assert.deepEqual(notice, { type: 'peer-joined', peerId: joined.peerId });
+  assert.ok(!('auth' in notice), 'peer-joined must omit auth entirely when absent (never send null)');
+  camera.close();
+  parent.close();
+});
+
+test('auth-challenge is relayed from the camera to the addressed parent only', async () => {
+  const { camera, roomId } = await newRoom();
+  const a = await joinParent(roomId, camera);
+  const b = await joinParent(roomId, camera);
+  camera.send({ type: 'auth-challenge', peerId: a.peerId, nonce: 'nonce-c', sig: 'sig-cam' });
+  const relayed = await a.parent.next();
+  assert.deepEqual(relayed, { type: 'auth-challenge', peerId: a.peerId, nonce: 'nonce-c', sig: 'sig-cam' });
+  await b.parent.expectSilence();
+  camera.close();
+  a.parent.close();
+  b.parent.close();
+});
+
+test('auth-response is relayed to the camera with the sender peerId stamped, payload intact', async () => {
+  const { camera, roomId } = await newRoom();
+  const a = await joinParent(roomId, camera);
+  const b = await joinParent(roomId, camera);
+  // Parent A addresses B's peerId; the server must stamp A's real id but leave
+  // the deviceId/pk/sig payload untouched (§8.2, anti-spoofing like `answer`).
+  a.parent.send({ type: 'auth-response', peerId: b.peerId, deviceId: 'dev-A', pk: 'pk-A', sig: 'sig-A' });
+  const relayed = await camera.next();
+  assert.deepEqual(relayed, { type: 'auth-response', peerId: a.peerId, deviceId: 'dev-A', pk: 'pk-A', sig: 'sig-A' });
+  camera.close();
+  a.parent.close();
+  b.parent.close();
+});
+
+test('auth captured at join is re-sent in peer-joined after a camera reclaim', async () => {
+  const { camera, roomId, reclaimToken } = await newRoom();
+  const parent = await WsClient.connect(srv.wsUrl);
+  const auth = { deviceId: 'dev-1', pk: 'pk-1', nonce: 'nonce-1' };
+  parent.send({ type: 'join-room', roomId, auth });
+  const joined = await parent.next();
+  const firstNotice = await camera.next();
+  assert.deepEqual(firstNotice, { type: 'peer-joined', peerId: joined.peerId, auth });
+
+  camera.close();
+  assert.deepEqual(await parent.next(), { type: 'camera-left' });
+
+  const camera2 = await WsClient.connect(srv.wsUrl);
+  camera2.send({ type: 'create-room', roomId, reclaimToken });
+  assert.equal((await camera2.next()).type, 'room-created');
+  const reannounce = await camera2.next();
+  assert.deepEqual(reannounce, { type: 'peer-joined', peerId: joined.peerId, auth });
+
+  camera2.close();
+  parent.close();
+});
+
+test('pair-request is never relayed by the cloud server (unknown type, ignored)', async () => {
+  const { camera, roomId } = await newRoom();
+  const { parent, peerId } = await joinParent(roomId, camera);
+  parent.send({ type: 'pair-request', deviceId: 'd', name: 'n', pk: 'p', proof: 'pf' });
+  await camera.expectSilence();
+  await parent.expectSilence();
+  // The connection is unharmed — a normal offer still relays afterwards.
+  camera.send({ type: 'offer', peerId, sdp: 'after-pair', sdpType: 'offer' });
+  const offer = await parent.next();
+  assert.equal(offer.sdp, 'after-pair');
+  camera.close();
+  parent.close();
+});

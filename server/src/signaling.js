@@ -23,7 +23,8 @@ function sendError(ws, code, message) {
 }
 
 export function createSignaling({ gcIntervalMs = 60_000 } = {}) {
-  /** roomId -> { roomId, reclaimToken, camera, parents: Map<peerId, ws>, emptySince } */
+  /** roomId -> { roomId, reclaimToken, camera, parents: Map<peerId, ws>,
+   *              parentAuth: Map<peerId, auth>, emptySince } */
   const rooms = new Map();
 
   function generateRoomId() {
@@ -71,6 +72,7 @@ export function createSignaling({ gcIntervalMs = 60_000 } = {}) {
     } else if (ctx.role === 'parent') {
       if (room.parents.get(ctx.peerId) === ws) {
         room.parents.delete(ctx.peerId);
+        room.parentAuth.delete(ctx.peerId);
         sendJson(room.camera, { type: 'peer-left', peerId: ctx.peerId });
         maybeMarkEmpty(room);
       }
@@ -97,8 +99,14 @@ export function createSignaling({ gcIntervalMs = 60_000 } = {}) {
       ctx.room = room;
       sendJson(ws, { type: 'room-created', roomId: room.roomId, reclaimToken: room.reclaimToken });
       // Re-announce live parents so the camera re-creates a PC + offer per peer.
+      // Carry the auth captured at join time (§8.2) so the camera re-runs its
+      // trusted-device challenge for each re-announced parent.
       for (const [peerId, parentWs] of room.parents) {
-        if (isOpen(parentWs)) sendJson(ws, { type: 'peer-joined', peerId });
+        if (!isOpen(parentWs)) continue;
+        const peerJoined = { type: 'peer-joined', peerId };
+        const savedAuth = room.parentAuth.get(peerId);
+        if (savedAuth != null) peerJoined.auth = savedAuth;
+        sendJson(ws, peerJoined);
       }
       return;
     }
@@ -108,6 +116,7 @@ export function createSignaling({ gcIntervalMs = 60_000 } = {}) {
       reclaimToken: randomUUID(),
       camera: ws,
       parents: new Map(),
+      parentAuth: new Map(),
       emptySince: null,
     };
     rooms.set(room.roomId, room);
@@ -146,16 +155,26 @@ export function createSignaling({ gcIntervalMs = 60_000 } = {}) {
     if (peerId === null) peerId = randomUUID();
 
     room.parents.set(peerId, ws);
+    // Optional trusted-device auth (§8.2): passed through verbatim, contents not
+    // validated by the server. Captured per peerId so it survives a camera reclaim.
+    const auth = msg.auth;
+    if (auth != null) room.parentAuth.set(peerId, auth);
+    else room.parentAuth.delete(peerId);
     room.emptySince = null;
     ctx.role = 'parent';
     ctx.room = room;
     ctx.peerId = peerId;
     sendJson(ws, { type: 'room-joined', roomId: room.roomId, peerId });
-    // Camera responds by creating a PC + sending an offer (§2.1).
-    sendJson(room.camera, { type: 'peer-joined', peerId });
+    // Camera responds with an auth-challenge when auth is present, else an offer (§2.1).
+    const peerJoined = { type: 'peer-joined', peerId };
+    if (auth != null) peerJoined.auth = auth;
+    sendJson(room.camera, peerJoined);
   }
 
-  /** offer/answer/ice/ice-restart: relayed verbatim, routed on peerId (§2.2). */
+  /** offer/answer/ice/ice-restart/auth-challenge/auth-response: relayed verbatim,
+   *  routed on peerId (§2.2). auth-challenge flows camera→parent like offer;
+   *  auth-response flows parent→camera like answer (peerId stamped server-side,
+   *  the deviceId/pk/sig payload left untouched). */
   function relayNegotiation(ws, ctx, msg, raw) {
     const room = ctx.room;
     if (!room) {
@@ -196,6 +215,8 @@ export function createSignaling({ gcIntervalMs = 60_000 } = {}) {
       case 'answer':
       case 'ice':
       case 'ice-restart':
+      case 'auth-challenge':
+      case 'auth-response':
         relayNegotiation(ws, ctx, msg, raw);
         break;
       case 'hb':

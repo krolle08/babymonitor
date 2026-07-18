@@ -43,6 +43,7 @@ public final class Signaling {
         String role;    // "camera" | "parent" | null
         Room room;      // null when not in a room
         String peerId;  // parents only
+        JsonNode auth;  // parents only: trusted-device auth captured at join (§8.2), or null
 
         Conn(WsContext ws) {
             this.ws = ws;
@@ -153,7 +154,8 @@ public final class Signaling {
         switch (msg.get("type").asText()) {
             case "create-room" -> handleCreateRoom(conn, msg);
             case "join-room" -> handleJoinRoom(conn, msg);
-            case "offer", "answer", "ice", "ice-restart" -> relayNegotiation(conn, msg, raw);
+            case "offer", "answer", "ice", "ice-restart", "auth-challenge", "auth-response" ->
+                    relayNegotiation(conn, msg, raw);
             case "hb", "noise" -> fanout(conn, msg, raw);
             case "leave" -> leaveRoom(conn);
             default -> {
@@ -187,11 +189,15 @@ public final class Signaling {
             created.put("reclaimToken", room.reclaimToken);
             sendJson(conn, created);
             // Re-announce live parents so the camera re-creates a PC + offer per peer.
+            // Carry the auth captured at join time (§8.2) so the camera re-runs its
+            // trusted-device challenge for each re-announced parent.
             for (Map.Entry<String, Conn> entry : room.parents.entrySet()) {
-                if (isOpen(entry.getValue())) {
+                Conn parent = entry.getValue();
+                if (isOpen(parent)) {
                     ObjectNode joined = MAPPER.createObjectNode();
                     joined.put("type", "peer-joined");
                     joined.put("peerId", entry.getKey());
+                    if (parent.auth != null) joined.set("auth", parent.auth);
                     sendJson(conn, joined);
                 }
             }
@@ -246,6 +252,10 @@ public final class Signaling {
 
         room.parents.put(peerId, conn);
         if (stale != null) terminate(stale);
+        // Optional trusted-device auth (§8.2): passed through verbatim, contents not
+        // validated by the server. Captured on the parent's Conn so it survives a reclaim.
+        JsonNode authField = msg.get("auth");
+        conn.auth = (authField != null && !authField.isNull()) ? authField.deepCopy() : null;
         room.emptySince = null;
         conn.role = "parent";
         conn.room = room;
@@ -255,14 +265,20 @@ public final class Signaling {
         joined.put("roomId", room.roomId);
         joined.put("peerId", peerId);
         sendJson(conn, joined);
-        // Camera responds by creating a PC + sending an offer (§2.1).
+        // Camera responds with an auth-challenge when auth is present, else an offer (§2.1).
         ObjectNode peerJoined = MAPPER.createObjectNode();
         peerJoined.put("type", "peer-joined");
         peerJoined.put("peerId", peerId);
+        if (conn.auth != null) peerJoined.set("auth", conn.auth);
         sendJson(room.camera, peerJoined);
     }
 
-    /** offer/answer/ice/ice-restart: relayed verbatim, routed on peerId (§2.2). */
+    /**
+     * offer/answer/ice/ice-restart/auth-challenge/auth-response: relayed verbatim,
+     * routed on peerId (§2.2). auth-challenge flows camera→parent like offer;
+     * auth-response flows parent→camera like answer (peerId stamped server-side,
+     * the deviceId/pk/sig payload left untouched).
+     */
     private void relayNegotiation(Conn conn, ObjectNode msg, String raw) {
         Room room = conn.room;
         if (room == null) {
