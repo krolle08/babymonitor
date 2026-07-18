@@ -29,9 +29,9 @@ Unknown message types MUST be ignored by both sides (forward compatibility, NTR6
 |---|---|---|---|
 | camera → server | `create-room` | `roomId?`, `reclaimToken?` | Without fields: new room. With both: reclaim an existing room after reconnect. |
 | server → camera | `room-created` | `roomId`, `reclaimToken` | `roomId` is a 6-char A–Z/2–9 code (no 0/O/1/I). `reclaimToken` is a UUID the camera stores for reconnects. |
-| parent → server | `join-room` | `roomId`, `peerId?` | `peerId` present = rejoin after reconnect (server reuses it if free). |
+| parent → server | `join-room` | `roomId`, `peerId?`, `auth?` | `peerId` present = rejoin after reconnect (server reuses it if free). `auth` (§8.2): `{deviceId, pk, nonce}` — trusted-device authentication; relayed to the camera inside `peer-joined`. |
 | server → parent | `room-joined` | `roomId`, `peerId` | `peerId` is a UUID identifying this parent in the room. |
-| server → camera | `peer-joined` | `peerId` | Camera responds by creating a PC + sending an `offer`. |
+| server → camera | `peer-joined` | `peerId`, `auth?` | Camera responds with `auth-challenge` (§8.2) when `auth` present, else (guest mode) directly with an `offer`. |
 | server → camera | `peer-left` | `peerId` | Parent socket closed/left. Camera closes that PC. |
 | server → parents | `camera-left` | — | Camera socket closed. Parents show RECONNECTING and wait; room persists 10 min for reclaim. |
 | both → server | `leave` | — | Graceful exit; same effects as socket close. |
@@ -48,6 +48,12 @@ both sides are gone.
 | parent → server → camera | `answer` | `peerId`, `sdp`, `sdpType` ("answer") |
 | both → server → other side | `ice` | `peerId`, `candidate` (`{candidate, sdpMid, sdpMLineIndex}`) |
 | parent → server → camera | `ice-restart` | `peerId` | Parent detected FROZEN (F5); camera performs ICE restart + new offer for that peer. |
+| camera → server → parent | `auth-challenge` | `peerId`, `nonce`, `sig` | §8.2. Relayed verbatim like `offer`. |
+| parent → server → camera | `auth-response` | `peerId`, `deviceId`, `pk`, `sig` | §8.2. Relayed verbatim like `answer`. |
+
+`pair-request`/`pair-response` (§8.1) are **never relayed by the cloud server** — pairing
+is a LAN-only ceremony. New error code: `NOT_TRUSTED` (camera rejects an
+unauthenticated or unknown device; sent to that parent, then the peer is dropped).
 
 The server never parses SDP — it routes on (`roomId` from the socket's session, `peerId`).
 
@@ -208,3 +214,96 @@ class AppConfig {
 `GET /api/ice-config` → `200 {iceServers: [{urls, username?, credential?}]}` — both app
 roles fetch this at session start; on failure they fall back to the default STUN-only
 config (NTR3).
+
+---
+
+## 7. LAN transport — camera-hosted signaling (F11)
+
+The camera app embeds its own WebSocket signaling endpoint so that pairing and
+(re)connection at home — or on a phone hotspot — need **no internet and no cloud**.
+
+- **Endpoint:** `ws://<camera-ip>:<port>/ws`. Default port `47800`; if taken, the next
+  free port is used — the *advertised* port is authoritative.
+- **Discovery:** mDNS/DNS-SD service type **`_babymonitor._tcp`**, instance name = the
+  camera's display name, TXT records: `id` (deviceId), `name`, `proto=1`, `port`.
+- **Protocol:** identical JSON messages to §2 with these deltas:
+  - There is exactly one implicit room. Parents send `join-room` with `roomId: "LOCAL"`;
+    `create-room` is not used (the camera *is* the room). All other flows (`offer`,
+    `answer`, `ice`, `ice-restart`, `hb`, `noise`, `auth-*`, capacity, `peer-left`)
+    behave exactly as in §2 with the camera playing the server role.
+  - `pair-request`/`pair-response` (§8.1) are accepted **only** on this transport.
+- **Parent connection order** (every initial connect *and* every reconnect attempt):
+  1. last-known LAN address of a trusted camera → 2. mDNS discovery (2 s budget) →
+  3. cloud signaling (§2). First success wins; the order guarantees the same-network
+  case never depends on the internet.
+- Untrusted `join-room` on the LAN transport is rejected with `NOT_TRUSTED` unless the
+  camera has pairing mode active (§8.1) or the join carries the current room code shown
+  on the camera screen (guest bootstrap, same as cloud).
+
+## 8. Device identity & trust (F12)
+
+- Every install generates an **Ed25519 keypair** on first run. The private key lives in
+  platform secure storage (Android Keystore-backed / iOS Keychain); it never leaves the
+  device. `pk` fields are the base64url-encoded 32-byte public key.
+- `deviceId` = the existing 16-hex identifier (§5.3 settings).
+- **Trust store** (per device): list of `{deviceId, name, pk, role: camera|parent,
+  addedAt}`. Public data — stored in normal preferences. Removing an entry (revocation)
+  takes effect on the next auth attempt; the camera additionally drops live peers whose
+  `deviceId` is revoked.
+
+### 8.1 Pairing ceremony (QR + LAN, one-time)
+
+1. Camera enters *pairing mode* (UI action): generates a one-time `token`
+   (32 random bytes, base64url, valid 5 minutes, single use) and shows a QR encoding:
+   `{"v":1,"t":"pair","deviceId":…,"name":…,"pk":…,"port":…,"addrs":[…],"token":…}`
+2. Parent scans the QR → immediately adds the camera to its trust store (public key
+   obtained optically = MITM-proof) → connects to the LAN endpoint → sends
+   `pair-request {deviceId, name, pk, proof}` where
+   `proof = base64url( Ed25519-sign(privKey_parent, utf8(token) ∥ utf8(deviceId_parent)) )`.
+3. Camera verifies the token is outstanding + the signature verifies with the presented
+   `pk` → stores the parent in its trust store, consumes the token → replies
+   `pair-response {accepted: true, deviceId, name, pk}`.
+   On failure: `pair-response {accepted: false, reason}` — parent removes the
+   provisional camera entry.
+
+### 8.2 Session authentication (every connection, both transports)
+
+Sequence per parent join (camera drives it; the cloud server just relays §2.2):
+
+1. Parent → `join-room` with `auth: {deviceId, pk, nonce_p}` (`nonce_p` = fresh 32-byte
+   base64url challenge for the camera).
+2. Camera → `auth-challenge {peerId, nonce_c, sig}` where
+   `sig = sign(privKey_camera, nonce_p ∥ utf8(peerId))`.
+   The parent verifies `sig` against its trusted camera `pk`; mismatch → disconnect +
+   user alert "Camera identity changed — re-pair" (possible MITM or reinstalled camera).
+3. Parent → `auth-response {peerId, deviceId, pk, sig}` where
+   `sig = sign(privKey_parent, nonce_c ∥ utf8(peerId))`.
+4. Camera checks `pk` is in its trust store (by `deviceId`) and the signature verifies
+   → proceeds with the `offer` (§2.2). Otherwise → `error {code: NOT_TRUSTED}` to that
+   peer and drops it.
+
+Guest mode (bootstrap, NTR2): a `join-room` **without** `auth` is served only when the
+camera's "allow room-code joins" setting is on (default **on**) — the room code typed by
+the guest is the authorization. Trusted devices never need the code.
+
+## 9. Golden path — monitoring never depends on the server (NTR7)
+
+Monitoring (capture → stream → watch → auto-heal) is the **golden path**. Everything
+involving the cloud backend is a **parallel, best-effort flow** that may fail silently
+(logged + retried with backoff) without ever touching the golden path.
+
+Camera session start order (normative):
+
+1. **Golden path first, all local:** acquire media → wakelock → start LAN signaling
+   endpoint → advertise via mDNS. The camera is now fully watchable at home — even with
+   the internet down.
+2. **In parallel, detached:** connect to cloud signaling + `create-room`/reclaim (for
+   remote viewers) · start the sleep-log session · flush queued events. Each of these
+   retries independently; a permanent cloud outage degrades exactly one capability
+   (remote viewing) and delays log sync — it must never delay, interrupt, or error the
+   local stream, and it must never surface as a monitoring failure in the UI (a small
+   "cloud offline" indicator is permitted; NTR1 alerts are reserved for the golden path).
+
+Implementation rule: no code on the golden path may `await` a cloud call. `ApiClient` /
+`SleepLogService` calls from monitoring code are fire-and-forget; `fetchIceConfig()`
+has a hard timeout and a STUN-only fallback; LAN operation uses no ICE config fetch.
