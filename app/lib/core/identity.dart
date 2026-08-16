@@ -175,6 +175,16 @@ class PairingPayload {
   /// Serializes to the compact JSON string encoded into the QR code.
   String serialize() => jsonEncode(toJson());
 
+  /// A compact, typeable pairing code carrying the exact same data as the QR:
+  /// base64url (unpadded) of [serialize], prefixed with `BM1-` so a human can
+  /// recognise it. Used for manual "enter a code" pairing when scanning is
+  /// impractical (e.g. joining from an emulator). Because it carries the same
+  /// [pk] as the QR, typing it preserves the QR's MITM-resistance (§8.1).
+  String encodeCompact() {
+    final bytes = utf8.encode(serialize());
+    return 'BM1-${base64Url.encode(bytes).replaceAll('=', '')}';
+  }
+
   /// The camera's own identity as advertised in this payload.
   DeviceIdentity get identity =>
       DeviceIdentity(deviceId: deviceId, name: name, publicKey: pk);
@@ -226,5 +236,30 @@ class PairingPayload {
       addrs: addrs,
       token: token,
     );
+  }
+
+  /// Parses either a raw QR payload (JSON from [serialize]) or a compact code
+  /// from [encodeCompact] that was typed/pasted by hand. Surrounding
+  /// whitespace, an optional `BM1-` prefix, and missing base64 padding are all
+  /// tolerated. Throws [FormatException] on anything else.
+  factory PairingPayload.parseFlexible(String source) {
+    var text = source.trim();
+    if (text.isEmpty) {
+      throw const FormatException('empty pairing code');
+    }
+    // A raw QR payload is JSON — hand it to the strict parser unchanged.
+    if (text.startsWith('{')) return PairingPayload.parse(text);
+    // Otherwise treat it as a compact base64url code (optionally BM1-prefixed).
+    if (text.startsWith('BM1-')) text = text.substring(4);
+    text = text.replaceAll(RegExp(r'\s'), '');
+    // Restore the '=' padding the compact encoder strips.
+    final padded = text.padRight((text.length + 3) ~/ 4 * 4, '=');
+    final String json;
+    try {
+      json = utf8.decode(base64Url.decode(padded));
+    } catch (_) {
+      throw FormatException('not a valid pairing code', source);
+    }
+    return PairingPayload.parse(json);
   }
 }

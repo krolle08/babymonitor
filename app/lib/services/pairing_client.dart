@@ -17,7 +17,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../core/auth_engine.dart';
@@ -55,7 +55,7 @@ class PairingClient {
     TrustService? trust,
     SettingsService? settings,
     AuthEngine? authEngine,
-    this.connectTimeout = const Duration(seconds: 4),
+    this.connectTimeout = const Duration(seconds: 6),
     this.responseTimeout = const Duration(seconds: 10),
   })  : _crypto = crypto,
         _trust = trust,
@@ -113,9 +113,15 @@ class PairingClient {
       }
       // null → this address was unreachable; fall through to the next.
     }
+    final tried = payload.addrs.isEmpty
+        ? 'no address'
+        : payload.addrs.join(', ');
     return PairingResult.failed(
-        'Could not reach the camera on the local network. Make sure both '
-        'phones are on the same WiFi and pairing is still open.');
+        'Could not reach the camera on the local network (tried: $tried). '
+        'Check the camera is still monitoring with pairing open, and that '
+        'this device can reach it. Joining from an emulator? Run the camera '
+        'on a real phone — an emulator can dial out to it, but its own '
+        'address ($tried) is not reachable from your phone.');
   }
 
   List<String> _candidateUrls(PairingPayload payload) {
@@ -124,6 +130,15 @@ class PairingClient {
       if (addr.trim().isEmpty) continue;
       final host = addr.contains(':') ? '[$addr]' : addr; // bracket IPv6
       urls.add('ws://$host:${payload.port}/ws');
+    }
+    // Dev-only: one Android emulator can't reach another emulator's LAN IP,
+    // but every emulator can reach its host at 10.0.2.2. Combined with
+    // `adb -s <camera-emulator> forward tcp:<port> tcp:<port>`, this lets two
+    // emulators complete the LAN pairing ceremony. Tried last (only if the
+    // real addresses fail), compiled out of release, and a harmless fast
+    // fail on real hardware.
+    if (kDebugMode) {
+      urls.add('ws://10.0.2.2:${payload.port}/ws');
     }
     return urls;
   }

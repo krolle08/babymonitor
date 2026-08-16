@@ -20,6 +20,7 @@ import '../config/app_config.dart';
 import '../core/health_state.dart';
 import '../core/identity.dart';
 import '../services/discovery_service.dart';
+import '../services/keep_alive_service.dart';
 import '../services/notification_service.dart';
 import '../services/settings_service.dart';
 import '../services/trust_service.dart';
@@ -169,6 +170,14 @@ class _ParentScreenState extends State<ParentScreen>
       _inRoom = true;
       _roomLabel = label;
     });
+    // Hold the connection alive when the screen goes off / the phone sleeps
+    // (Doze would otherwise suspend us). Foreground service + partial wakelock,
+    // Android-only; the battery nudge self-skips if already exempt.
+    unawaited(KeepAliveService.instance.start(
+      title: 'Watching $label',
+      text: 'Connected — listening for sounds',
+    ));
+    unawaited(KeepAliveService.instance.requestIgnoreBatteryOptimizations());
   }
 
   void _onHealth(HealthState state) {
@@ -237,6 +246,7 @@ class _ParentScreenState extends State<ParentScreen>
       });
       unawaited(_refreshNearby());
     }
+    unawaited(KeepAliveService.instance.stop());
     if (session != null) await session.leave();
   }
 
@@ -249,6 +259,7 @@ class _ParentScreenState extends State<ParentScreen>
     _subs.clear();
     final session = _session;
     _session = null;
+    unawaited(KeepAliveService.instance.stop());
     if (session != null) unawaited(session.leave());
     if (_rendererReady) _renderer.srcObject = null;
     unawaited(_renderer.dispose());

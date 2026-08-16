@@ -11,6 +11,7 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../core/identity.dart';
@@ -50,6 +51,7 @@ class _PairingQrOverlayState extends State<PairingQrOverlay> {
 
   Set<String> _knownParentIds = {};
   String? _payload;
+  String? _manualCode;
   bool _loading = true;
   bool _unavailable = false;
   bool _expired = false;
@@ -81,8 +83,15 @@ class _PairingQrOverlayState extends State<PairingQrOverlay> {
       });
       return;
     }
+    String? manualCode;
+    try {
+      manualCode = PairingPayload.parse(payload).encodeCompact();
+    } on FormatException {
+      manualCode = null; // never happens for our own payload; degrade quietly
+    }
     setState(() {
       _payload = payload;
+      _manualCode = manualCode;
       _loading = false;
     });
     _startTicker();
@@ -237,6 +246,10 @@ class _PairingQrOverlayState extends State<PairingQrOverlay> {
               ),
             ],
           ),
+          if (_manualCode != null) ...[
+            const SizedBox(height: 20),
+            _ManualCodeCard(code: _manualCode!),
+          ],
         ],
         const SizedBox(height: 24),
         OutlinedButton(
@@ -323,6 +336,69 @@ class _PairingQrOverlayState extends State<PairingQrOverlay> {
           child: const Text('Done'),
         ),
       ],
+    );
+  }
+}
+
+/// "Can't scan?" fallback: shows the typeable pairing code with a copy button,
+/// for joining from a device that can't point a camera at the QR (e.g. an
+/// emulator). Carries the same data as the QR, so it is equally MITM-safe.
+class _ManualCodeCard extends StatelessWidget {
+  const _ManualCodeCard({required this.code});
+
+  final String code;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text(
+            'Can’t scan? Enter this code',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.titleSmall,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'On the other phone tap “Add camera” → “Enter code”.',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: SelectableText(
+              code,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+            ),
+          ),
+          const SizedBox(height: 8),
+          FilledButton.tonalIcon(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: code));
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(
+                  const SnackBar(content: Text('Pairing code copied')),
+                );
+            },
+            icon: const Icon(Icons.copy, size: 18),
+            label: const Text('Copy code'),
+          ),
+        ],
+      ),
     );
   }
 }

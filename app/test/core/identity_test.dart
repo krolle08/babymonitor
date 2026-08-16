@@ -147,5 +147,36 @@ void main() {
       });
       expect(PairingPayload.parse(noAddrs).addrs, isEmpty);
     });
+
+    test('encodeCompact/parseFlexible round-trip (manual entry)', () {
+      final code = payload.encodeCompact();
+      expect(code, startsWith('BM1-'));
+      // Typeable: no JSON punctuation or base64 padding to trip up a user.
+      expect(code.contains('{'), isFalse);
+      expect(code.contains('='), isFalse);
+      final parsed = PairingPayload.parseFlexible(code);
+      expect(parsed.deviceId, payload.deviceId);
+      expect(parsed.pk, payload.pk);
+      expect(parsed.port, payload.port);
+      expect(parsed.addrs, payload.addrs);
+      expect(parsed.token, payload.token);
+    });
+
+    test('parseFlexible also accepts a raw QR payload and tolerates spacing',
+        () {
+      final fromJson = PairingPayload.parseFlexible(payload.serialize());
+      expect(fromJson.deviceId, payload.deviceId);
+      // Surrounding whitespace (e.g. from a clipboard) is trimmed.
+      final padded = PairingPayload.parseFlexible('  ${payload.encodeCompact()}\n');
+      expect(padded.token, payload.token);
+    });
+
+    test('parseFlexible rejects gibberish and empty input', () {
+      expect(() => PairingPayload.parseFlexible(''), throwsFormatException);
+      expect(() => PairingPayload.parseFlexible('   '), throwsFormatException);
+      expect(
+          () => PairingPayload.parseFlexible('BM1-not*valid*base64'),
+          throwsFormatException);
+    });
   });
 }

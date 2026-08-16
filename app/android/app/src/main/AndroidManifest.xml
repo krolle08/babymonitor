@@ -15,6 +15,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- WebRTC audio over Bluetooth headsets (Android 12+). -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Hold the parent's WebRTC connection alive through Doze while the screen
+         is off (all-night monitoring). Foreground service + partial wakelock. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <application
         android:label="Baby Monitor"
         android:name="${applicationName}"
@@ -41,6 +46,12 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <!-- Keeps the parent connected while the phone sleeps / screen is off.
+             mediaPlayback: the parent is playing back the nursery audio. -->
+        <service
+            android:name=".MonitorForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

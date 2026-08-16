@@ -11,6 +11,7 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
@@ -20,6 +21,10 @@ import '../services/settings_service.dart';
 import '../services/trust_service.dart';
 import '../services/webrtc_service.dart';
 import '../widgets/pairing_qr_overlay.dart';
+
+/// How the parent chooses to add a camera (§8.1): optically by QR, or by a
+/// typed/pasted code for devices without a usable camera (e.g. emulators).
+enum _AddMethod { scan, manual }
 
 class TrustedDevicesScreen extends StatefulWidget {
   const TrustedDevicesScreen({super.key, this.cameraSession, this.trust});
@@ -94,14 +99,136 @@ class _TrustedDevicesScreenState extends State<TrustedDevicesScreen> {
   // --- Parent role: scan a camera's QR and pair over the LAN ---
 
   Future<void> _addFromParent() async {
-    final payload = await Navigator.of(context).push<PairingPayload>(
-      MaterialPageRoute<PairingPayload>(
-        fullscreenDialog: true,
-        builder: (_) => const _ScanCameraScreen(),
-      ),
-    );
+    final method = await _chooseAddMethod();
+    if (method == null || !mounted) return;
+    PairingPayload? payload;
+    switch (method) {
+      case _AddMethod.scan:
+        payload = await Navigator.of(context).push<PairingPayload>(
+          MaterialPageRoute<PairingPayload>(
+            fullscreenDialog: true,
+            builder: (_) => const _ScanCameraScreen(),
+          ),
+        );
+      case _AddMethod.manual:
+        payload = await _promptForManualCode();
+    }
     if (payload == null || !mounted) return;
     await _pair(payload);
+  }
+
+  /// Lets the parent pick how to add a camera: point the camera at the QR, or
+  /// type/paste the code (the only option that works where there's no usable
+  /// camera, e.g. an emulator).
+  Future<_AddMethod?> _chooseAddMethod() {
+    return showModalBottomSheet<_AddMethod>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.qr_code_scanner),
+              title: const Text('Scan QR code'),
+              subtitle: const Text('Point at the code on the camera phone'),
+              onTap: () => Navigator.of(sheetContext).pop(_AddMethod.scan),
+            ),
+            ListTile(
+              leading: const Icon(Icons.keyboard),
+              title: const Text('Enter code'),
+              subtitle: const Text('Type or paste the code — no camera needed'),
+              onTap: () => Navigator.of(sheetContext).pop(_AddMethod.manual),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Prompts for a typed/pasted pairing code and parses it. Returns the parsed
+  /// [PairingPayload], or `null` if cancelled. Invalid input is reported inline
+  /// so the dialog stays open for a correction.
+  Future<PairingPayload?> _promptForManualCode() async {
+    final controller = TextEditingController();
+    final payload = await showDialog<PairingPayload>(
+      context: context,
+      builder: (dialogContext) {
+        String? error;
+        return StatefulBuilder(
+          builder: (dialogContext, setLocal) {
+            void submit() {
+              try {
+                final parsed = PairingPayload.parseFlexible(controller.text);
+                Navigator.of(dialogContext).pop(parsed);
+              } on FormatException {
+                setLocal(() =>
+                    error = 'That doesn’t look like a valid pairing code.');
+              }
+            }
+
+            return AlertDialog(
+              title: const Text('Enter pairing code'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    'On the camera phone, open Trusted devices → Add device, '
+                    'then copy the code shown under the QR.',
+                    style: Theme.of(dialogContext).textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: controller,
+                    autofocus: true,
+                    minLines: 2,
+                    maxLines: 4,
+                    textInputAction: TextInputAction.done,
+                    decoration: InputDecoration(
+                      labelText: 'Pairing code',
+                      hintText: 'BM1-…',
+                      errorText: error,
+                      border: const OutlineInputBorder(),
+                    ),
+                    onChanged: (_) {
+                      if (error != null) setLocal(() => error = null);
+                    },
+                    onSubmitted: (_) => submit(),
+                  ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: () async {
+                        final data =
+                            await Clipboard.getData(Clipboard.kTextPlain);
+                        final text = data?.text?.trim();
+                        if (text != null && text.isNotEmpty) {
+                          controller.text = text;
+                          if (error != null) setLocal(() => error = null);
+                        }
+                      },
+                      icon: const Icon(Icons.paste, size: 18),
+                      label: const Text('Paste'),
+                    ),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(onPressed: submit, child: const Text('Join')),
+              ],
+            );
+          },
+        );
+      },
+    );
+    controller.dispose();
+    return payload;
   }
 
   Future<void> _pair(PairingPayload payload) async {

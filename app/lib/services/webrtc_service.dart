@@ -355,6 +355,10 @@ class CameraSession {
       addrs: addrs,
       token: token,
     );
+    // Also surface the typeable code so it can be entered by hand when
+    // scanning is impractical (e.g. joining from an emulator) — grab it from
+    // the `flutter run` console during testing.
+    debugPrint('Pairing code (manual entry): ${payload.encodeCompact()}');
     return payload.serialize();
   }
 
