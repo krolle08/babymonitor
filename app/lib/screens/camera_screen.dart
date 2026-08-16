@@ -10,6 +10,7 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../services/settings_service.dart';
@@ -47,6 +48,8 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _tornDown = false;
   String _sensitivity = SettingsService.instance.noiseSensitivity;
   bool _allowCodeJoins = SettingsService.instance.allowCodeJoins;
+  bool _fullscreen = false;
+  bool _torchOn = false;
 
   Timer? _roomPoll;
 
@@ -74,6 +77,18 @@ class _CameraScreenState extends State<CameraScreen> {
     }));
     _subs.add(_session.parentTalk.listen((event) {
       if (mounted) setState(() => _parentTalking = event.on);
+    }));
+    // Reflect sensitivity changes triggered by a remote parent so the
+    // local SegmentedButton stays in sync (F7 remote-control).
+    _subs.add(_session.sensitivityState.listen((value) {
+      if (mounted && value != _sensitivity) {
+        setState(() => _sensitivity = value);
+      }
+    }));
+    // Reflect torch state so the local button icon matches reality when
+    // a parent toggles the torch remotely.
+    _subs.add(_session.torchState.listen((on) {
+      if (mounted && on != _torchOn) setState(() => _torchOn = on);
     }));
   }
 
@@ -141,6 +156,9 @@ class _CameraScreenState extends State<CameraScreen> {
       unawaited(_session.dispose());
       unawaited(_log.dispose());
     }
+    if (_fullscreen) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     _renderer.srcObject = null;
     unawaited(_renderer.dispose());
     super.dispose();
@@ -161,12 +179,46 @@ class _CameraScreenState extends State<CameraScreen> {
     await SettingsService.instance.setAllowCodeJoins(value);
   }
 
+  void _toggleFullscreen() {
+    setState(() => _fullscreen = !_fullscreen);
+    SystemChrome.setEnabledSystemUIMode(
+      _fullscreen ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+  }
+
+  Future<void> _toggleTorch() async {
+    final ok = await _session.setTorchEnabled(!_torchOn);
+    if (!ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Torch is not supported on this camera.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_fullscreen && _phase == _Phase.running) {
+      return _buildFullscreen(context);
+    }
     return Scaffold(
       appBar: AppBar(
         title: const Text('Camera unit'),
         actions: [
+          if (_phase == _Phase.running) ...[
+            IconButton(
+              icon: Icon(_torchOn ? Icons.flashlight_on : Icons.flashlight_off),
+              tooltip: _torchOn ? 'Turn torch off' : 'Turn torch on (night vision)',
+              onPressed: () => unawaited(_toggleTorch()),
+            ),
+            IconButton(
+              icon: const Icon(Icons.fullscreen),
+              tooltip: 'Fullscreen',
+              onPressed: _toggleFullscreen,
+            ),
+          ],
           IconButton(
             icon: const Icon(Icons.devices_outlined),
             tooltip: 'Trusted devices',
@@ -185,6 +237,50 @@ class _CameraScreenState extends State<CameraScreen> {
           _Phase.error => _buildError(context),
           _Phase.running => _buildRunning(context),
         },
+      ),
+    );
+  }
+
+  /// Video-only edge-to-edge view — the on-screen chrome collapses to a
+  /// floating exit + torch pair so nothing obscures the crib view.
+  Widget _buildFullscreen(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          RTCVideoView(
+            _renderer,
+            mirror: false,
+            objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+          ),
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topRight,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _FullscreenAction(
+                      icon: _torchOn
+                          ? Icons.flashlight_on
+                          : Icons.flashlight_off,
+                      tooltip: _torchOn ? 'Turn torch off' : 'Turn torch on',
+                      onPressed: () => unawaited(_toggleTorch()),
+                    ),
+                    const SizedBox(width: 8),
+                    _FullscreenAction(
+                      icon: Icons.fullscreen_exit,
+                      tooltip: 'Exit fullscreen',
+                      onPressed: _toggleFullscreen,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -502,6 +598,33 @@ class _WarningBanner extends StatelessWidget {
             onPressed: onDismiss,
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Circular semi-transparent button used only in fullscreen mode over the
+/// live video — visible against arbitrary crib footage.
+class _FullscreenAction extends StatelessWidget {
+  const _FullscreenAction({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xCC0A101F),
+      shape: const CircleBorder(side: BorderSide(color: Color(0x33FFFFFF))),
+      child: IconButton(
+        icon: Icon(icon, color: const Color(0xFFC6D0E2)),
+        tooltip: tooltip,
+        onPressed: onPressed,
       ),
     );
   }

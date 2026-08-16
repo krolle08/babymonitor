@@ -74,6 +74,10 @@ class _ParentScreenState extends State<ParentScreen>
   Set<String> _nearby = {};
   bool _scanningNearby = false;
 
+  bool _fullscreen = false;
+  String _remoteSensitivity = SettingsService.instance.noiseSensitivity;
+  bool _remoteTorch = false;
+
   @override
   void initState() {
     super.initState();
@@ -163,6 +167,15 @@ class _ParentScreenState extends State<ParentScreen>
     _subs.add(session.latencies.listen(_onLatency));
     _subs.add(session.noiseAlerts.listen(_onNoiseAlert));
     _subs.add(session.transport.listen(_onTransport));
+    // Remote-control feedback: reflect whatever the baby unit reports as
+    // its currently applied sensitivity + torch state (any parent's
+    // toggle triggers a fan-out — every parent stays in sync).
+    _subs.add(session.remoteSensitivityStream.listen((value) {
+      if (mounted) setState(() => _remoteSensitivity = value);
+    }));
+    _subs.add(session.remoteTorchStream.listen((on) {
+      if (mounted) setState(() => _remoteTorch = on);
+    }));
     await session.join(roomId); // never throws (NTR3)
     if (!mounted) return;
     setState(() {
@@ -234,6 +247,9 @@ class _ParentScreenState extends State<ParentScreen>
     }
     _subs.clear();
     if (_rendererReady) _renderer.srcObject = null;
+    if (_fullscreen) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     if (mounted) {
       setState(() {
         _inRoom = false;
@@ -243,11 +259,34 @@ class _ParentScreenState extends State<ParentScreen>
         _retrySeconds = null;
         _latencyMs = null;
         _transport = 'none';
+        _fullscreen = false;
+        _remoteTorch = false;
       });
       unawaited(_refreshNearby());
     }
     unawaited(KeepAliveService.instance.stop());
     if (session != null) await session.leave();
+  }
+
+  void _toggleFullscreen() {
+    setState(() => _fullscreen = !_fullscreen);
+    SystemChrome.setEnabledSystemUIMode(
+      _fullscreen ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+  }
+
+  void _setRemoteSensitivity(String value) {
+    // Optimistic UI update; the camera echoes back the applied state so
+    // the SegmentedButton settles on the actually-applied value even if
+    // the request was dropped (dying data channel — never breaks UI).
+    setState(() => _remoteSensitivity = value);
+    _session?.setRemoteSensitivity(value);
+  }
+
+  void _toggleRemoteTorch() {
+    final next = !_remoteTorch;
+    setState(() => _remoteTorch = next);
+    _session?.setRemoteTorch(next);
   }
 
   @override
@@ -261,6 +300,9 @@ class _ParentScreenState extends State<ParentScreen>
     _session = null;
     unawaited(KeepAliveService.instance.stop());
     if (session != null) unawaited(session.leave());
+    if (_fullscreen) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     if (_rendererReady) _renderer.srcObject = null;
     unawaited(_renderer.dispose());
     _codeController.dispose();
@@ -478,26 +520,42 @@ class _ParentScreenState extends State<ParentScreen>
       onDismiss: () => unawaited(_leave()),
       child: Scaffold(
         backgroundColor: Colors.black,
-        appBar: AppBar(
-          title: Text(_roomLabel),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.history),
-              tooltip: 'History',
-              onPressed: _openHistory,
-            ),
-            IconButton(
-              icon: const Icon(Icons.settings_outlined),
-              tooltip: 'Settings',
-              onPressed: _openSettings,
-            ),
-            IconButton(
-              icon: const Icon(Icons.logout),
-              tooltip: 'Leave',
-              onPressed: () => unawaited(_leave()),
-            ),
-          ],
-        ),
+        appBar: _fullscreen
+            ? null
+            : AppBar(
+                title: Text(_roomLabel),
+                actions: [
+                  IconButton(
+                    icon: Icon(_remoteTorch
+                        ? Icons.flashlight_on
+                        : Icons.flashlight_off),
+                    tooltip: _remoteTorch
+                        ? 'Turn camera torch off'
+                        : 'Turn camera torch on (night vision)',
+                    onPressed: _toggleRemoteTorch,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.fullscreen),
+                    tooltip: 'Fullscreen',
+                    onPressed: _toggleFullscreen,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.history),
+                    tooltip: 'History',
+                    onPressed: _openHistory,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.settings_outlined),
+                    tooltip: 'Settings',
+                    onPressed: _openSettings,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.logout),
+                    tooltip: 'Leave',
+                    onPressed: () => unawaited(_leave()),
+                  ),
+                ],
+              ),
         body: Stack(
           fit: StackFit.expand,
           children: [
@@ -538,8 +596,33 @@ class _ParentScreenState extends State<ParentScreen>
                           _TransportBadge(transport: _transport),
                         const Spacer(),
                         if (_latencyMs != null) _LatencyChip(ms: _latencyMs!),
+                        if (_fullscreen) ...[
+                          const SizedBox(width: 8),
+                          _FullscreenAction(
+                            icon: _remoteTorch
+                                ? Icons.flashlight_on
+                                : Icons.flashlight_off,
+                            tooltip: _remoteTorch
+                                ? 'Turn torch off'
+                                : 'Turn torch on',
+                            onPressed: _toggleRemoteTorch,
+                          ),
+                          const SizedBox(width: 8),
+                          _FullscreenAction(
+                            icon: Icons.fullscreen_exit,
+                            tooltip: 'Exit fullscreen',
+                            onPressed: _toggleFullscreen,
+                          ),
+                        ],
                       ],
                     ),
+                    if (!_fullscreen && _hasVideo) ...[
+                      const SizedBox(height: 12),
+                      _RemoteControlPanel(
+                        sensitivity: _remoteSensitivity,
+                        onSensitivityChanged: _setRemoteSensitivity,
+                      ),
+                    ],
                     if (_health == HealthState.reconnecting)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
@@ -575,6 +658,96 @@ class _ParentScreenState extends State<ParentScreen>
               ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// Compact sensitivity control on the watching view — remote-controls the
+/// baby unit's noise gate live (F7). Rendered on the dark stream backdrop,
+/// so it inlines its own dark styling instead of relying on the theme.
+class _RemoteControlPanel extends StatelessWidget {
+  const _RemoteControlPanel({
+    required this.sensitivity,
+    required this.onSensitivityChanged,
+  });
+
+  final String sensitivity;
+  final ValueChanged<String> onSensitivityChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xCC0A101F),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0x33FFFFFF)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.graphic_eq,
+              size: 16, color: Color(0xFF93A1BC)),
+          const SizedBox(width: 8),
+          const Text(
+            'Noise',
+            style: TextStyle(
+              color: Color(0xFF93A1BC),
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.8,
+            ),
+          ),
+          const SizedBox(width: 10),
+          SegmentedButton<String>(
+            style: SegmentedButton.styleFrom(
+              foregroundColor: const Color(0xFFC6D0E2),
+              selectedForegroundColor: Colors.white,
+              selectedBackgroundColor: const Color(0xFF2563EB),
+              side: const BorderSide(color: Color(0x33FFFFFF)),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              textStyle: const TextStyle(fontSize: 12),
+            ),
+            segments: const [
+              ButtonSegment(value: 'low', label: Text('Low')),
+              ButtonSegment(value: 'medium', label: Text('Med')),
+              ButtonSegment(value: 'high', label: Text('High')),
+            ],
+            selected: {sensitivity},
+            showSelectedIcon: false,
+            onSelectionChanged: (selection) =>
+                onSensitivityChanged(selection.first),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Circular semi-transparent button used on top of the live video — twin
+/// of the same-named widget in camera_screen.dart.
+class _FullscreenAction extends StatelessWidget {
+  const _FullscreenAction({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xCC0A101F),
+      shape: const CircleBorder(side: BorderSide(color: Color(0x33FFFFFF))),
+      child: IconButton(
+        icon: Icon(icon, color: const Color(0xFFC6D0E2)),
+        tooltip: tooltip,
+        onPressed: onPressed,
+        iconSize: 20,
       ),
     );
   }

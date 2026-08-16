@@ -180,6 +180,11 @@ class CameraSession {
   MediaStream? _localStream;
   NoiseMonitor? _noiseMonitor;
   Timer? _hbTimer;
+  bool _torchOn = false;
+  final StreamController<bool> _torchCtrl =
+      StreamController<bool>.broadcast();
+  final StreamController<String> _sensitivityCtrl =
+      StreamController<String>.broadcast();
   StreamSubscription<Map<String, dynamic>>? _cloudMsgSub;
   StreamSubscription<bool>? _cloudConnSub;
   StreamSubscription<Map<String, dynamic>>? _lanMsgSub;
@@ -333,6 +338,44 @@ class CameraSession {
     if (threshold == null) return;
     unawaited(_prefs.setNoiseSensitivity(sensitivity));
     _noiseMonitor?.threshold = threshold;
+    _sensitivityCtrl.add(sensitivity);
+    // Broadcast the new state to every connected parent so remote UIs
+    // reflect the actual applied value.
+    _broadcastControl({'t': 'sensitivity-state', 'value': sensitivity});
+  }
+
+  /// Enables or disables the camera torch (F-night-vision). Applied to the
+  /// live video track; the actual capability depends on the device (most
+  /// Android phones support it, some iOS devices don't). Returns true if
+  /// the platform accepted the request.
+  Future<bool> setTorchEnabled(bool enabled) async {
+    final track = _localStream?.getVideoTracks().firstOrNull;
+    if (track == null) return false;
+    try {
+      await track.setTorch(enabled);
+      _torchOn = enabled;
+      _torchCtrl.add(enabled);
+      _broadcastControl({'t': 'torch-state', 'on': enabled});
+      return true;
+    } catch (e) {
+      debugPrint('CameraSession: setTorch($enabled) failed: $e');
+      return false;
+    }
+  }
+
+  bool get torchEnabled => _torchOn;
+
+  /// Stream of torch-on-state changes (local toggles + remote-triggered).
+  Stream<bool> get torchState => _torchCtrl.stream;
+
+  /// Stream of sensitivity changes (local Segmented + remote-set).
+  Stream<String> get sensitivityState => _sensitivityCtrl.stream;
+
+  /// Fan-out a control message to every peer with an open data channel.
+  void _broadcastControl(Map<String, dynamic> msg) {
+    for (final peer in _peers.values) {
+      if (peer.channelOpen) _channelSend(peer.channel, msg);
+    }
   }
 
   // --- Pairing (§8.1) ---
@@ -668,10 +711,26 @@ class CameraSession {
   void _onChannelMessage(String peerId, RTCDataChannelMessage message) {
     final msg = _decodeChannelMessage(message);
     if (msg == null) return;
-    if (msg['t'] == 'talk' && msg['on'] is bool) {
-      if (!_talk.isClosed) {
-        _talk.add(TalkEvent(peerId: peerId, on: msg['on'] as bool));
-      }
+    switch (msg['t']) {
+      case 'talk':
+        if (msg['on'] is bool && !_talk.isClosed) {
+          _talk.add(TalkEvent(peerId: peerId, on: msg['on'] as bool));
+        }
+      case 'set-sensitivity':
+        // Remote-control from a parent: apply live and broadcast the new
+        // state back to every connected parent (so all UIs stay in sync).
+        final value = msg['value'];
+        if (value is String &&
+            AppConfig.noiseThresholds.containsKey(value)) {
+          setNoiseSensitivity(value);
+        }
+      case 'set-torch':
+        final on = msg['on'];
+        if (on is bool) {
+          unawaited(setTorchEnabled(on));
+        }
+      default:
+        break;
     }
   }
 
@@ -848,6 +907,8 @@ class CameraSession {
     await _warnings.close();
     await _talk.close();
     await _parentCount.close();
+    await _torchCtrl.close();
+    await _sensitivityCtrl.close();
   }
 
   void _warn(String message) {
@@ -927,6 +988,12 @@ class ParentSession {
   late final FreezeDetector _freezeDetector;
   StreamSubscription<HealthState>? _healthSub;
 
+  String? _remoteSensitivity;
+  bool _remoteTorch = false;
+  final StreamController<String> _remoteSensitivityCtrl =
+      StreamController<String>.broadcast();
+  final StreamController<bool> _remoteTorchCtrl =
+      StreamController<bool>.broadcast();
   final StreamController<MediaStream> _remoteStreams =
       StreamController<MediaStream>.broadcast();
   final StreamController<NoiseAlert> _noiseAlerts =
@@ -1363,10 +1430,52 @@ class ParentSession {
         if (ts is num && level is num) {
           _onNoiseMessage(ts.toInt(), level.toDouble());
         }
+      case 'sensitivity-state':
+        final value = msg['value'];
+        if (value is String && !_remoteSensitivityCtrl.isClosed) {
+          _remoteSensitivity = value;
+          _remoteSensitivityCtrl.add(value);
+        }
+      case 'torch-state':
+        final on = msg['on'];
+        if (on is bool && !_remoteTorchCtrl.isClosed) {
+          _remoteTorch = on;
+          _remoteTorchCtrl.add(on);
+        }
       default:
         break;
     }
   }
+
+  /// Send a sensitivity change (Low / Medium / High) to the camera unit
+  /// over the data channel. The camera unit applies it live and echoes
+  /// back a `sensitivity-state` so [remoteSensitivityStream] reflects
+  /// the actually-applied value.
+  void setRemoteSensitivity(String sensitivity) {
+    _channelSend(_channel, {'t': 'set-sensitivity', 'value': sensitivity});
+  }
+
+  /// Toggle the camera unit's torch (night-vision helper). Whether the
+  /// device supports it is out of the parent's hands - the baby unit
+  /// tries, then broadcasts back a `torch-state` reflecting the actual
+  /// resulting state (which stays `false` on unsupported hardware).
+  void setRemoteTorch(bool on) {
+    _channelSend(_channel, {'t': 'set-torch', 'on': on});
+  }
+
+  /// Last known sensitivity as reported by the camera. Null until the
+  /// first `sensitivity-state` arrives.
+  String? get remoteSensitivity => _remoteSensitivity;
+
+  /// Last known torch state as reported by the camera.
+  bool get remoteTorch => _remoteTorch;
+
+  /// Stream of sensitivity-state broadcasts from the camera (fires
+  /// whenever any parent toggles it, plus once at first-connect).
+  Stream<String> get remoteSensitivityStream => _remoteSensitivityCtrl.stream;
+
+  /// Stream of torch-state broadcasts from the camera.
+  Stream<bool> get remoteTorchStream => _remoteTorchCtrl.stream;
 
   void _onHeartbeat(int seq, int tsMs) {
     final now = _now();
@@ -1551,6 +1660,8 @@ class ParentSession {
     await _retryCountdown.close();
     await _latencies.close();
     await _securityAlerts.close();
+    await _remoteSensitivityCtrl.close();
+    await _remoteTorchCtrl.close();
   }
 
   Future<void> _disposePc() async {
