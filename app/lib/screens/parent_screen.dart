@@ -272,6 +272,22 @@ class _ParentScreenState extends State<ParentScreen>
             : ListenMode.alwaysOn,
       );
 
+  /// Long-press on the stream: tell the camera to meter its exposure there
+  /// (F15). Nothing to walk into the nursery for.
+  void _meterAt(MeteringPoint point) {
+    final session = _session;
+    if (session == null || !session.canControlCamera) return;
+    final controls = _cameraState.controls.copyWith(exposurePoint: point);
+    setState(() => _cameraState = _cameraState.copyWith(controls: controls));
+    session.sendCameraControl(controls);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Metering the camera’s exposure here'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
   IconData get _audioIcon => switch (_listenMode) {
         ListenMode.muted => Icons.volume_off,
         ListenMode.alwaysOn => Icons.volume_up,
@@ -673,6 +689,8 @@ class _ParentScreenState extends State<ParentScreen>
                   objectFit: _fullscreen
                       ? RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
                       : RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                  meteringPoint: _cameraState.controls.exposurePoint,
+                  onMeter: _meterAt,
                 )
               else
                 Center(

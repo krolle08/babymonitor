@@ -62,6 +62,11 @@ class AppConfig {
   static const int captureFrameRate = 15;
   static const int nightCaptureFrameRate = 8;
 
+  /// Bounds for the night frame rate. 5 fps is about as low as it is worth
+  /// going: below that the picture stops reading as live video.
+  static const int minNightFrameRate = 5;
+  static const int maxNightFrameRate = 15;
+
   /// Extra picture gain night mode starts from, -1.0 … 1.0.
   static const double nightModeBrightness = 0.35;
 

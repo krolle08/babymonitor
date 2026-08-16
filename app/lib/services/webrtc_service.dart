@@ -274,6 +274,7 @@ class CameraSession {
       'video': _videoConstraints(night: _controls.nightMode),
     });
     await _refreshCapabilities();
+    await _applyExposurePoint(); // a saved metering point survives a restart
 
     // 2. Wakelock (F2) — failure is surfaced, not fatal.
     try {
@@ -375,18 +376,27 @@ class CameraSession {
 
   // --- Camera image + sound controls (F13/F15) ---
 
-  Map<String, dynamic> _videoConstraints({required bool night}) => {
+  Map<String, dynamic> _videoConstraints({required bool night}) {
+    final cameraId = _controls.cameraId;
+    return {
+      // An explicit lens wins; otherwise the rear camera, which is the one
+      // pointed at the crib in every normal setup (F15).
+      if (cameraId != null && cameraId.isNotEmpty)
+        'deviceId': cameraId
+      else
         'facingMode': 'environment',
-        'width': {'ideal': 640},
-        'height': {'ideal': 480},
-        // A lower frame rate lets the sensor expose each frame for longer,
-        // which is what actually makes a dark nursery visible (F15).
-        'frameRate': {
-          'ideal': night
-              ? AppConfig.nightCaptureFrameRate
-              : AppConfig.captureFrameRate,
-        },
-      };
+      'width': {'ideal': 640},
+      'height': {'ideal': 480},
+      // A lower frame rate lets the sensor expose each frame for longer,
+      // which is what actually makes a dark nursery visible (F15).
+      'frameRate': {
+        'ideal': night
+            ? _controls.nightFrameRate.clamp(
+                AppConfig.minNightFrameRate, AppConfig.maxNightFrameRate)
+            : AppConfig.captureFrameRate,
+      },
+    };
+  }
 
   MediaStreamTrack? get _videoTrack {
     final tracks = _localStream?.getVideoTracks();
@@ -394,8 +404,9 @@ class CameraSession {
     return tracks.first;
   }
 
-  /// Re-reads what the current capture track supports (torch). Failures leave
-  /// the capability off — the UI then greys the switch out instead of lying.
+  /// Re-reads what the current capture track supports (torch) and which lenses
+  /// this phone has. Failures leave the capability off — the UI then greys the
+  /// control out instead of lying about it.
   Future<void> _refreshCapabilities() async {
     var torch = false;
     try {
@@ -404,7 +415,24 @@ class CameraSession {
     } catch (e) {
       debugPrint('CameraSession: hasTorch() failed: $e');
     }
-    _capabilities = CameraCapabilities(torch: torch);
+    var cameras = _capabilities.cameras;
+    try {
+      // Only meaningful after getUserMedia has run once (the platform hides
+      // labels until camera permission is granted).
+      final devices = await navigator.mediaDevices.enumerateDevices();
+      cameras = [
+        for (final device in devices)
+          if (device.kind == 'videoinput')
+            CameraOption(
+              deviceId: device.deviceId,
+              label: device.label,
+              facing: CameraOption.facingFromLabel(device.label),
+            ),
+      ];
+    } catch (e) {
+      debugPrint('CameraSession: enumerateDevices() failed: $e');
+    }
+    _capabilities = CameraCapabilities(torch: torch, cameras: cameras);
   }
 
   /// Applies image + sound settings live, from this unit or from a parent
@@ -418,12 +446,18 @@ class CameraSession {
     if (next.sound != previous.sound) {
       _noiseMonitor?.applyFilter(next.sound);
     }
-    if (next.nightMode != previous.nightMode) {
-      await _recaptureVideo();
-    }
-    if (next.light != previous.light ||
-        (next.nightMode != previous.nightMode && next.light)) {
+    // Anything that changes the capture format needs a new track: a different
+    // lens, night mode on or off, or a new night frame rate while night mode
+    // is running.
+    final recaptured = next.cameraId != previous.cameraId ||
+        next.nightMode != previous.nightMode ||
+        (next.nightMode && next.nightFrameRate != previous.nightFrameRate);
+    if (recaptured) await _recaptureVideo(previous);
+    if (next.light != previous.light || (recaptured && next.light)) {
       await _applyTorch(next.light);
+    }
+    if (next.exposurePoint != previous.exposurePoint || recaptured) {
+      await _applyExposurePoint();
     }
 
     unawaited(_prefs.setCameraControls(_controls));
@@ -434,6 +468,26 @@ class CameraSession {
   /// handler and by the UI sheets.
   Future<void> applyControlPatch(Map<String, dynamic> patch) =>
       applyControls(_controls.patch(patch));
+
+  /// Points the auto-exposure at the crib, or hands metering back to the
+  /// camera when there is no point set (F15). Unsupported hardware just logs —
+  /// the picture is unchanged, which is the safe outcome.
+  Future<void> _applyExposurePoint() async {
+    final track = _videoTrack;
+    if (track == null) return;
+    final point = _controls.exposurePoint;
+    try {
+      // Deliberately *not* CameraExposureMode.locked: locking freezes the
+      // current exposure, which would ignore the region we just set. What we
+      // want is auto-exposure that meters here — the region, not a lock.
+      await Helper.setExposurePoint(
+        track,
+        point == null ? null : math.Point<double>(point.x, point.y),
+      );
+    } catch (e) {
+      debugPrint('CameraSession: setExposurePoint failed: $e');
+    }
+  }
 
   Future<void> _applyTorch(bool on) async {
     final track = _videoTrack;
@@ -451,13 +505,17 @@ class CameraSession {
     }
   }
 
-  /// Swaps the capture track for one with the current night-mode profile and
-  /// hands it to every parent's sender. The old track is stopped first: most
-  /// phones will not open a second capture session on the same camera.
-  Future<void> _recaptureVideo() async {
+  /// Swaps the capture track for one matching the current lens + night-mode
+  /// profile and hands it to every parent's sender. The old track is stopped
+  /// first: most phones will not open a second capture session on the same
+  /// camera.
+  ///
+  /// If the new settings cannot be captured — a lens that will not open, a
+  /// frame rate the sensor refuses — it falls back to [previous] rather than
+  /// leaving the crib dark.
+  Future<void> _recaptureVideo(CameraControls previous) async {
     final stream = _localStream;
     if (stream == null) return;
-    final night = _controls.nightMode;
     final old = stream.getVideoTracks();
     for (final track in old) {
       try {
@@ -469,21 +527,20 @@ class CameraSession {
     }
     MediaStreamTrack? fresh;
     try {
-      fresh = await _captureVideoTrack(night: night);
+      fresh = await _captureVideoTrack(night: _controls.nightMode);
     } catch (e) {
-      debugPrint('CameraSession: night-mode recapture failed: $e');
+      debugPrint('CameraSession: recapture failed: $e');
     }
-    if (fresh == null && night) {
-      // Fall back to the normal profile rather than leave the crib dark.
-      _controls = _controls.copyWith(nightMode: false);
+    if (fresh == null && _controls != previous) {
+      _controls = previous; // back to what was demonstrably working
       try {
-        fresh = await _captureVideoTrack(night: false);
+        fresh = await _captureVideoTrack(night: previous.nightMode);
       } catch (e) {
         debugPrint('CameraSession: fallback recapture failed: $e');
       }
     }
     if (fresh == null) {
-      _warn('The camera could not be restarted after changing night mode. '
+      _warn('The camera could not be restarted after that change. '
           'Stop and start monitoring to get the picture back.');
       return;
     }

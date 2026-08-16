@@ -226,17 +226,33 @@ phone must be adjustable from either unit, without walking into the nursery.
   and the F13 sound filter
 - **Brightness** is a render gain (−100 % … +100 %) applied by *both* units, so the
   framing check on the camera matches what parents see
-- **Night mode** lowers the capture frame rate (`nightCaptureFrameRate`, longer
-  exposure per frame) and applies a night render curve — extra gain, lifted blacks,
+- **Night mode** lowers the capture frame rate (adjustable 5–15 fps, longer exposure
+  per frame) and applies a night render curve — extra gain, lifted blacks,
   desaturated, because in low light the colour channels are mostly sensor noise
+- **Tap-to-meter**: long-press the picture on either unit to put the auto-exposure
+  region there. A bright doorway or window otherwise fools the meter into
+  underexposing the crib — the one thing you need to see. The chosen point is drawn
+  as a reticle, survives restarts, and resets to automatic from the control sheet
+- **Lens picker**: on a phone with more than one camera, choose which one captures.
+  This exists for infrared: rear sensors sit behind an IR-cut filter, front ones
+  often do not, so an IR illuminator is only usable with the right lens selected
 - **Camera light** switches the camera phone's torch, off by default and never
   persisted; greyed out on phones without one (capabilities are reported to parents)
 - Changes travel P2P on the `health` data channel (PROTOCOL §4.1): no server involved,
   works on LAN with the internet down (NTR7)
 - The camera is the single source of truth — it applies what the hardware allows and
   broadcasts the result, so a refused control snaps back on every unit
-- Failure to re-capture in night mode falls back to the normal profile and warns,
-  rather than leaving the crib dark (NTR3)
+- Any re-capture (night mode, lens, frame rate) falls back to the previous working
+  settings and warns, rather than leaving the crib dark (NTR3)
+
+**On night vision, honestly:** none of this is true night vision. Phone rear cameras
+sit behind an IR-cut filter, and WebRTC capture bypasses the computational night
+modes phones are marketed on — the app gets a raw Camera2 stream, no frame stacking.
+In a pitch-black room there is no signal to amplify. What these controls do is make
+the most of *some* light: the reliable fix is a dim amber night light (~1–5 lux), and
+the infrared route needs both an IR illuminator (940 nm, invisible) and a lens that
+can see it — hence the lens picker. USB IR cameras are not an option: the plugin has
+no external-camera support.
 
 **Acceptance criteria:**
 - [ ] A parent changes brightness and night mode while watching; the camera unit's
@@ -247,6 +263,13 @@ phone must be adjustable from either unit, without walking into the nursery.
 - [ ] A phone with no torch shows the switch disabled, not broken
 - [ ] Controls are unavailable (with an explanation) until the stream is up, and
       never block or delay the stream itself
+- [ ] Long-pressing the crib from a parent phone visibly re-exposes the picture for
+      it, and the reticle shows where the camera is metering
+- [ ] A long-press on a letterbox bar changes nothing (rather than metering a spot
+      the user never chose)
+- [ ] Selecting the front lens from a parent phone switches the capture, and a lens
+      that fails to open falls back to the working one
+- [ ] Dropping the night frame rate to 5 fps visibly brightens a dim room
 
 ---
 

@@ -339,7 +339,21 @@ class _CameraScreenState extends State<CameraScreen> {
         brightness: _cameraState.controls.brightness,
         nightMode: _cameraState.controls.nightMode,
         objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+        meteringPoint: _cameraState.controls.exposurePoint,
+        onMeter: _phase == _Phase.running ? _meterAt : null,
       );
+
+  /// Long-press on the preview: meter the exposure there (F15).
+  void _meterAt(MeteringPoint point) {
+    unawaited(_session
+        .applyControls(_cameraState.controls.copyWith(exposurePoint: point)));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Metering exposure here'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
 
   /// Full-screen framing check (F14): the whole screen is the crib view, with
   /// an overlay that fades out so nothing competes with the picture.

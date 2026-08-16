@@ -158,6 +158,75 @@ void main() {
     });
   });
 
+  // F15 — lens choice, metering and the night capture rate.
+  group('CameraControlsPanel camera', () {
+    const twoLenses = CameraState(
+      controls: CameraControls.defaults,
+      capabilities: CameraCapabilities(
+        torch: true,
+        cameras: [
+          CameraOption(deviceId: '0', label: 'Camera 0', facing: 'back'),
+          CameraOption(deviceId: '1', label: 'Camera 1', facing: 'front'),
+        ],
+      ),
+    );
+
+    testWidgets('no lens picker on a phone with one camera', (tester) async {
+      await pumpPanel(tester, state: withTorch, onChanged: (_) {});
+      expect(find.text('Lens'), findsNothing);
+    });
+
+    testWidgets('picking the front lens commits its device id', (tester) async {
+      CameraControls? committed;
+      await pumpPanel(
+        tester,
+        state: twoLenses,
+        onChanged: (controls) => committed = controls,
+      );
+
+      expect(find.text('Lens'), findsOneWidget);
+      await tester.tap(find.text('Front camera'));
+      await tester.pump();
+      expect(committed?.cameraId, '1');
+
+      // …and back to the default rear camera.
+      await tester.tap(find.text('Default'));
+      await tester.pump();
+      expect(committed?.cameraId, isNull);
+    });
+
+    testWidgets('metering explains itself and resets to auto', (tester) async {
+      CameraControls? committed;
+      await pumpPanel(
+        tester,
+        state: const CameraState(
+          controls: CameraControls(exposurePoint: MeteringPoint(0.25, 0.75)),
+          capabilities: CameraCapabilities(torch: true),
+        ),
+        onChanged: (controls) => committed = controls,
+      );
+
+      expect(find.textContaining('Metering on the spot you chose'),
+          findsOneWidget);
+      await tester.tap(find.text('Auto'));
+      await tester.pump();
+      expect(committed, isNotNull);
+      expect(committed!.exposurePoint, isNull);
+      expect(find.textContaining('Long-press the picture'), findsOneWidget);
+    });
+
+    testWidgets('the night frame rate appears only in night mode',
+        (tester) async {
+      await pumpPanel(tester, state: withTorch, onChanged: (_) {});
+      expect(find.text('Night frame rate'), findsNothing);
+
+      await tester.tap(find.widgetWithText(SwitchListTile, 'Night mode'));
+      await tester.pump();
+      expect(find.text('Night frame rate'), findsOneWidget);
+      expect(find.text('8 fps'), findsOneWidget);
+    });
+  });
+
   // F13 — what actually reaches this phone's speaker.
   group('CameraControlsPanel playback', () {
     testWidgets('the camera unit gets no "sound on this phone" section',

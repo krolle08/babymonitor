@@ -152,6 +152,9 @@ channel, no controls.
   "brightness": 0.0,      // -1.0 … 1.0 render gain, 0.0 = untouched
   "nightMode": false,     // low-light capture profile + night render curve
   "light": false,         // camera phone torch
+  "cameraId": null,       // lens device id; null = default (rear) camera
+  "exposurePoint": null,  // {x, y} 0…1 in FRAME coords; null = auto metering
+  "nightFrameRate": 8,    // 5 … 15 fps, used while nightMode is on
   "sound": {
     "threshold": 0.30,    // 0.05 … 0.95 — the bar (F7 presets: .50/.30/.15)
     "sustainMs": 2000,    // 0 … 15000 — ignore sound shorter than this
@@ -161,8 +164,11 @@ channel, no controls.
 }
 ```
 
-`caps` reports what the hardware can do: `{"torch": bool}`. Parents grey out
-what is not supported instead of offering a switch that does nothing.
+`caps` reports what the hardware can do:
+`{"torch": bool, "cameras": [{"deviceId", "label", "facing"}]}` — `facing` is
+`front` | `back` | `unknown`, parsed from the platform label (Android has no
+structured field for it). Parents grey out what is not supported instead of
+offering a switch that does nothing.
 
 Rules:
 
@@ -171,11 +177,26 @@ Rules:
   what it can, persists the result, and broadcasts `camera-state` to every
   parent — so a knob the hardware refuses (a phone with no torch) visibly snaps
   back, and all units always agree on the render settings.
+- For the two nullable fields (`cameraId`, `exposurePoint`) an explicit `null`
+  **is** a value meaning "back to automatic" — key *presence* decides, not the
+  value. Omit the key to leave the setting alone.
+- `cameraId` and `nightFrameRate` change the capture format, so applying them
+  re-captures (see below). Most phones filter infrared on the rear sensor but
+  not the front one, which is why the lens is a setting: an IR illuminator is
+  only usable with a lens that can see it.
+- `exposurePoint` is in **frame** coordinates, not widget coordinates. Both
+  units map a long-press through `mapTapToFrame()`, which accounts for the
+  letterboxing (`contain`) or cropping (`cover`) of the rendered video — a tap
+  on a black bar is discarded rather than metered somewhere the user did not
+  choose. It sets the auto-exposure *region* (`CONTROL_AE_REGIONS`), never an
+  AE lock: locking would freeze the exposure and ignore the region.
 - `brightness`/`nightMode` are applied at **render** time by both roles, so the
   camera operator's framing check matches what the parents see. `nightMode`
-  additionally re-captures at `nightCaptureFrameRate` (longer exposure per
-  frame); the swap briefly interrupts the picture and falls back to the normal
-  profile if the re-capture fails.
+  additionally re-captures at `nightFrameRate` (longer exposure per frame). Any
+  re-capture — night mode, lens, frame rate — stops the old track first (phones
+  will not open a second session on the same camera), briefly interrupts the
+  picture, and falls back to the **previous working settings** if the new ones
+  cannot be captured, rather than leaving the crib dark.
 - `sound` reconfigures the camera's `NoiseGate` live (F7 AC) — the gate is still
   the single decision point, and noise alerts (§2.3) are unchanged.
 - The torch is never persisted: a camera that restarts must not light the room
@@ -233,11 +254,14 @@ class AppConfig {
   static const audioGateStaleAfter = Duration(seconds: 10);    // F13 fail-loud
   static const captureFrameRate = 15;                          // F15
   static const nightCaptureFrameRate = 8;                      // F15
+  static const minNightFrameRate = 5;                          // F15
+  static const maxNightFrameRate = 15;                         // F15
   static const latencyAlertMs = 5000;                          // F1
   static const roomGraceMinutes = 10;
   // Runtime-configurable (persisted in SharedPreferences, editable in Settings):
   // signalingUrl, apiBaseUrl, familyToken, noiseThreshold, noiseSustainMs,
   // ignoreSteadySound, audioHangMs, cameraBrightness, cameraNightMode,
+  // cameraId, nightFrameRate, exposureX/exposureY,
   // listenMode + playbackVolume (per parent device, never sent on the wire)
 }
 ```
@@ -266,8 +290,10 @@ class AppConfig {
   floor. `effectiveThreshold` exposes the bar in force for the UI meter, and
   `open` is the squelch state that decides what parents hear (§4.2).
 - `camera_controls.dart` — `SoundFilter` / `CameraControls` / `CameraCapabilities`
-  / `CameraState` value objects (§4.1) with partial-patch JSON, plus
-  `videoColorMatrix()`, the 4x5 render matrix for brightness/night mode.
+  / `CameraOption` / `MeteringPoint` / `CameraState` value objects (§4.1) with
+  partial-patch JSON, plus `videoColorMatrix()` (the 4x5 render matrix for
+  brightness/night mode), `mapTapToFrame()` (long-press → frame coordinates,
+  letterbox-aware) and `ListenMode` (§4.2).
 - `heartbeat_tracker.dart` — tracks last-seen seq/time, exposes `missedCount(now)`.
 
 ### 5.3 `lib/services/` — Flutter/plugin-facing

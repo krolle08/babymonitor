@@ -195,6 +195,17 @@ class _CameraControlsPanelState extends State<CameraControlsPanel> {
         const SizedBox(height: 20),
         _SectionLabel('Picture'),
         const SizedBox(height: 8),
+        if (_state.capabilities.cameras.length > 1) ...[
+          _CameraPicker(
+            cameras: _state.capabilities.cameras,
+            selected: _controls.cameraId,
+            enabled: widget.enabled,
+            onSelected: (cameraId) => _commit(cameraId == null
+                ? _controls.copyWith(clearCameraId: true)
+                : _controls.copyWith(cameraId: cameraId)),
+          ),
+          const SizedBox(height: 12),
+        ],
         _BrightnessSlider(
           value: _controls.brightness,
           enabled: widget.enabled,
@@ -226,6 +237,25 @@ class _CameraControlsPanelState extends State<CameraControlsPanel> {
             'brightens the picture. Restarts the camera briefly.',
           ),
           isThreeLine: true,
+        ),
+        if (_controls.nightMode) ...[
+          _NightFrameRateSlider(
+            value: _controls.nightFrameRate,
+            enabled: widget.enabled,
+            onDragStart: () => _dragging = true,
+            onPreview: (fps) =>
+                _preview(_controls.copyWith(nightFrameRate: fps)),
+            onCommit: (fps) {
+              _dragging = false;
+              _commit(_controls.copyWith(nightFrameRate: fps));
+            },
+          ),
+          const SizedBox(height: 4),
+        ],
+        _MeteringRow(
+          point: _controls.exposurePoint,
+          enabled: widget.enabled,
+          onReset: () => _commit(_controls.copyWith(clearExposurePoint: true)),
         ),
         SwitchListTile(
           contentPadding: EdgeInsets.zero,
@@ -493,6 +523,163 @@ class _HangSlider extends StatelessWidget {
         ),
         Text(
           'Stops the speaker chattering on and off between sobs.',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+}
+
+/// Which lens captures (F15). On most phones only the front camera can see
+/// infrared, so this is what makes an IR illuminator usable at all.
+class _CameraPicker extends StatelessWidget {
+  const _CameraPicker({
+    required this.cameras,
+    required this.selected,
+    required this.enabled,
+    required this.onSelected,
+  });
+
+  final List<CameraOption> cameras;
+  final String? selected;
+  final bool enabled;
+
+  /// Null means "the default rear camera".
+  final ValueChanged<String?> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.cameraswitch_outlined, size: 20),
+            const SizedBox(width: 10),
+            const Text('Lens'),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          children: [
+            ChoiceChip(
+              label: const Text('Default'),
+              selected: selected == null,
+              onSelected: enabled ? (_) => onSelected(null) : null,
+            ),
+            for (final camera in cameras)
+              ChoiceChip(
+                label: Text(camera.shortLabel),
+                selected: selected == camera.deviceId,
+                onSelected:
+                    enabled ? (_) => onSelected(camera.deviceId) : null,
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(
+          'Switching lens restarts the camera briefly.',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+}
+
+/// Where the auto-exposure meters (F15). Set by long-pressing the picture on
+/// either unit; this row says what is in force and takes it back to automatic.
+class _MeteringRow extends StatelessWidget {
+  const _MeteringRow({
+    required this.point,
+    required this.enabled,
+    required this.onReset,
+  });
+
+  final MeteringPoint? point;
+  final bool enabled;
+  final VoidCallback onReset;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final point = this.point;
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: const Icon(Icons.center_focus_strong_outlined),
+      title: const Text('Exposure metering'),
+      subtitle: Text(
+        point == null
+            ? 'Automatic. Long-press the picture to meter on the crib — that '
+                'stops a bright doorway from darkening it.'
+            : 'Metering on the spot you chose '
+                '(${(point.x * 100).round()}%, ${(point.y * 100).round()}%). '
+                'Long-press the picture to move it.',
+        style: theme.textTheme.bodySmall
+            ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+      ),
+      isThreeLine: true,
+      trailing: point == null
+          ? null
+          : TextButton(
+              onPressed: enabled ? onReset : null,
+              child: const Text('Auto'),
+            ),
+    );
+  }
+}
+
+/// Night-mode capture rate (F15): lower = longer exposure = brighter.
+class _NightFrameRateSlider extends StatelessWidget {
+  const _NightFrameRateSlider({
+    required this.value,
+    required this.enabled,
+    required this.onDragStart,
+    required this.onPreview,
+    required this.onCommit,
+  });
+
+  final int value;
+  final bool enabled;
+  final VoidCallback onDragStart;
+  final ValueChanged<int> onPreview;
+  final ValueChanged<int> onCommit;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.shutter_speed, size: 20),
+            const SizedBox(width: 10),
+            const Expanded(child: Text('Night frame rate')),
+            Text(
+              '$value fps',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+        Slider(
+          value: value
+              .clamp(AppConfig.minNightFrameRate, AppConfig.maxNightFrameRate)
+              .toDouble(),
+          min: AppConfig.minNightFrameRate.toDouble(),
+          max: AppConfig.maxNightFrameRate.toDouble(),
+          divisions: AppConfig.maxNightFrameRate - AppConfig.minNightFrameRate,
+          onChangeStart: enabled ? (_) => onDragStart() : null,
+          onChanged: enabled ? (v) => onPreview(v.round()) : null,
+          onChangeEnd: enabled ? (v) => onCommit(v.round()) : null,
+        ),
+        Text(
+          'Lower is brighter and choppier: each frame is exposed for longer. '
+          'Changing it restarts the camera briefly.',
           style: theme.textTheme.bodySmall
               ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
         ),

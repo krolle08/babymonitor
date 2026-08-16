@@ -61,6 +61,10 @@ class SettingsService {
   static const _kAudioHangMs = 'audioHangMs';
   static const _kCameraBrightness = 'cameraBrightness'; // F15
   static const _kCameraNightMode = 'cameraNightMode';
+  static const _kCameraId = 'cameraId'; // F15 lens picker
+  static const _kNightFrameRate = 'nightFrameRate';
+  static const _kExposureX = 'exposureX';
+  static const _kExposureY = 'exposureY';
   static const _kListenMode = 'listenMode'; // F13, per parent device
   static const _kPlaybackVolume = 'playbackVolume';
 
@@ -230,11 +234,33 @@ class SettingsService {
   /// persisted — a camera that restarts must never light the room by itself.
   bool get cameraNightMode => _prefs.getBool(_kCameraNightMode) ?? false;
 
+  /// Which lens captures, or null for the default (rear) camera.
+  String? get cameraId {
+    final id = _prefs.getString(_kCameraId);
+    return (id == null || id.isEmpty) ? null : id;
+  }
+
+  /// Capture frame rate used in night mode.
+  int get nightFrameRate =>
+      (_prefs.getInt(_kNightFrameRate) ?? AppConfig.nightCaptureFrameRate)
+          .clamp(AppConfig.minNightFrameRate, AppConfig.maxNightFrameRate);
+
+  /// Where the camera meters exposure, or null for automatic.
+  MeteringPoint? get exposurePoint {
+    final x = _prefs.getDouble(_kExposureX);
+    final y = _prefs.getDouble(_kExposureY);
+    if (x == null || y == null) return null;
+    return MeteringPoint.tryFromJson({'x': x, 'y': y});
+  }
+
   /// The camera's saved controls, used as the starting point of a session.
   CameraControls get cameraControls => CameraControls(
         brightness: cameraBrightness,
         nightMode: cameraNightMode,
         sound: soundFilter,
+        cameraId: cameraId,
+        exposurePoint: exposurePoint,
+        nightFrameRate: nightFrameRate,
       );
 
   Future<void> setCameraControls(CameraControls controls) async {
@@ -242,6 +268,25 @@ class SettingsService {
         _kCameraBrightness, controls.brightness.clamp(-1.0, 1.0).toDouble());
     await _prefs.setBool(_kCameraNightMode, controls.nightMode);
     await setSoundFilter(controls.sound);
+    final cameraId = controls.cameraId;
+    if (cameraId == null || cameraId.isEmpty) {
+      await _prefs.remove(_kCameraId);
+    } else {
+      await _prefs.setString(_kCameraId, cameraId);
+    }
+    await _prefs.setInt(
+      _kNightFrameRate,
+      controls.nightFrameRate
+          .clamp(AppConfig.minNightFrameRate, AppConfig.maxNightFrameRate),
+    );
+    final point = controls.exposurePoint;
+    if (point == null) {
+      await _prefs.remove(_kExposureX);
+      await _prefs.remove(_kExposureY);
+    } else {
+      await _prefs.setDouble(_kExposureX, point.x);
+      await _prefs.setDouble(_kExposureY, point.y);
+    }
   }
 
   // --- Camera reconnect bookkeeping (PROTOCOL §2.1 reclaim) ---

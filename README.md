@@ -49,10 +49,15 @@ an alert (spec NTR1).
 - **Full screen (F14):** both units. The camera preview goes full screen so you can
   check the framing from the doorway; the parent stream goes full screen with chrome
   that fades after 4 s and comes back on a tap. Landscape works in both.
-- **Camera controls (F15):** brightness, night mode (lower capture frame rate = longer
-  exposure, plus a night render curve) and the camera phone's light, adjustable from
-  the camera unit *or* live from a watching parent. They travel P2P on the `health`
-  data channel — no server involved, so they work on LAN with the internet down.
+- **Camera controls (F15):** brightness, night mode (capture frame rate down to 5 fps
+  = longer exposure, plus a night render curve), long-press-to-meter the exposure on
+  the crib, a lens picker and the camera phone's light — adjustable from the camera
+  unit *or* live from a watching parent. They travel P2P on the `health` data
+  channel — no server involved, so they work on LAN with the internet down.
+  Note this is not true night vision: phone rear cameras have an IR-cut filter and
+  WebRTC capture bypasses the phone's computational night mode. A dim amber night
+  light (~1–5 lux) is what actually fixes a dark nursery; the lens picker exists so
+  an IR illuminator can be paired with a front camera that can see it.
 - **Sleep history:** the camera logs sessions + events (noise, reconnects, freezes,
   latency) to the server through an offline-safe queue. Parents browse history and
   flag dates with reasons like *Teething* or *Sick*.
