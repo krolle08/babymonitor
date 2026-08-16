@@ -265,6 +265,7 @@ class _SoundFilterCard extends StatelessWidget {
   final ValueChanged<SoundFilter> onChanged;
 
   static const int _maxSustainSeconds = 15;
+  static const int _maxHangSeconds = 120;
 
   @override
   Widget build(BuildContext context) {
@@ -350,6 +351,32 @@ class _SoundFilterCard extends StatelessWidget {
               ),
               isThreeLine: true,
             ),
+            Row(
+              children: [
+                const Expanded(
+                    child: Text('Keep playing after it goes quiet')),
+                Text(
+                  '${(filter.hang.inMilliseconds / 1000).round()}s',
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
+            ),
+            Slider(
+              value: (filter.hang.inMilliseconds / 1000.0)
+                  .clamp(0.0, _maxHangSeconds.toDouble()),
+              max: _maxHangSeconds.toDouble(),
+              divisions: _maxHangSeconds ~/ 5,
+              onChanged: (value) => onChanged(filter.copyWith(
+                  hang: Duration(seconds: (value / 5).round() * 5))),
+            ),
+            Text(
+              'What the filter ignores is never played on the parent phone. '
+              'This is how much of the tail of a real sound stays audible.',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
           ],
         ),
       ),

@@ -125,9 +125,10 @@ JSON text messages:
 
 | Message | Fields | Cadence |
 |---|---|---|
-| `{t: "hb", seq, ts, audioLevel}` | seq int, ts ms epoch, audioLevel 0–1 | every `heartbeatInterval` (3 s) |
+| `{t: "hb", seq, ts, audioLevel, gateOpen}` | seq int, ts ms epoch, audioLevel 0–1, gateOpen bool | every `heartbeatInterval` (3 s) |
 | `{t: "noise", ts, audioLevel}` | — | on noise-gate fire (30 s cooldown) |
-| `{t: "camera-state", controls, caps}` | see §4.1 | when the channel opens, on `get-camera-state`, and after every applied control change |
+| `{t: "audio-gate", open, ts}` | open bool | on every squelch transition (§4.2) |
+| `{t: "camera-state", controls, caps, gateOpen}` | see §4.1 | when the channel opens, on `get-camera-state`, and after every applied control change |
 
 Parent → camera on the same channel:
 
@@ -154,7 +155,8 @@ channel, no controls.
   "sound": {
     "threshold": 0.30,    // 0.05 … 0.95 — the bar (F7 presets: .50/.30/.15)
     "sustainMs": 2000,    // 0 … 15000 — ignore sound shorter than this
-    "ignoreSteady": true  // reject sound only just above the learned floor
+    "ignoreSteady": true, // reject sound only just above the learned floor
+    "hangMs": 15000       // 0 … 120000 — keep playing this long after quiet
   }
 }
 ```
@@ -179,6 +181,30 @@ Rules:
 - The torch is never persisted: a camera that restarts must not light the room
   on its own.
 
+### 4.2 Audio squelch — what the parent actually hears (F13)
+
+The filter decides what counts; the **squelch** decides what reaches the parent's
+speaker. Without it, the filter only silences *alerts* while the audio track plays
+snoring all night, which is the opposite of what a filter is for.
+
+- The camera's `NoiseGate` exposes `open`: true from the moment a sound passes the
+  bar *and* holds for `sustainMs`, until the room has been quiet for `hangMs`. The
+  30 s alert cooldown does **not** close it — an alert is an edge, the squelch is a
+  state.
+- Every transition is sent as `audio-gate` (sub-second reaction) and the current
+  value rides on every `hb` (resync within 3 s) and on `camera-state` (a parent that
+  has just connected knows immediately).
+- Parents apply it by toggling `enabled` on the **received** audio track. The stream
+  keeps flowing, so re-opening is instant — nothing to renegotiate and no missed
+  first second.
+- Each parent device has its own `ListenMode`, stored locally, never on the wire:
+  `filtered` (default — play only while the gate is open), `always` (play
+  everything, classic monitor), `muted` (play nothing). Mum can filter while dad
+  listens to everything.
+- **Fail loud (NTR1):** unknown or stale gate news means *audible*. A parent that
+  has heard nothing about the gate for `audioGateStaleAfter` (10 s) opens the audio
+  and keeps it open. Silence is never the failure mode.
+
 ---
 
 ## 5. App module contracts (Dart)
@@ -202,13 +228,17 @@ class AppConfig {
   static const defaultIgnoreSteadySound = true;                // F13
   static const steadySoundMargin = 0.08;                       // F13
   static const quietFloorAlpha = 0.05;                         // F13
+  static const defaultAudioHang = Duration(seconds: 15);       // F13 squelch
+  static const maxAudioHang = Duration(seconds: 120);          // F13
+  static const audioGateStaleAfter = Duration(seconds: 10);    // F13 fail-loud
   static const captureFrameRate = 15;                          // F15
   static const nightCaptureFrameRate = 8;                      // F15
   static const latencyAlertMs = 5000;                          // F1
   static const roomGraceMinutes = 10;
   // Runtime-configurable (persisted in SharedPreferences, editable in Settings):
   // signalingUrl, apiBaseUrl, familyToken, noiseThreshold, noiseSustainMs,
-  // ignoreSteadySound, cameraBrightness, cameraNightMode
+  // ignoreSteadySound, audioHangMs, cameraBrightness, cameraNightMode,
+  // listenMode + playbackVolume (per parent device, never sent on the wire)
 }
 ```
 
@@ -233,7 +263,8 @@ class AppConfig {
   (F13). The gate learns the room's quiet floor from **sub-threshold samples
   only** — deliberately, so a long cry can never train it into silence (NTR1) —
   and, when `ignoreSteady` is on, also requires `steadySoundMargin` above that
-  floor. `effectiveThreshold` exposes the bar in force for the UI meter.
+  floor. `effectiveThreshold` exposes the bar in force for the UI meter, and
+  `open` is the squelch state that decides what parents hear (§4.2).
 - `camera_controls.dart` — `SoundFilter` / `CameraControls` / `CameraCapabilities`
   / `CameraState` value objects (§4.1) with partial-patch JSON, plus
   `videoColorMatrix()`, the 4x5 render matrix for brightness/night mode.

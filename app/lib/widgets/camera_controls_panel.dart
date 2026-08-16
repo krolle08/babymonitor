@@ -26,6 +26,12 @@ Future<void> showCameraControlsSheet(
   bool enabled = true,
   String? disabledHint,
   String? meterNote,
+  ListenMode? listenMode,
+  double playbackVolume = 1.0,
+  bool audible = true,
+  Stream<bool>? audibleStates,
+  ValueChanged<ListenMode>? onListenModeChanged,
+  ValueChanged<double>? onVolumeChanged,
 }) {
   return showModalBottomSheet<void>(
     context: context,
@@ -46,6 +52,12 @@ Future<void> showCameraControlsSheet(
           enabled: enabled,
           disabledHint: disabledHint,
           meterNote: meterNote,
+          listenMode: listenMode,
+          playbackVolume: playbackVolume,
+          audible: audible,
+          audibleStates: audibleStates,
+          onListenModeChanged: onListenModeChanged,
+          onVolumeChanged: onVolumeChanged,
         ),
       ),
     ),
@@ -63,6 +75,12 @@ class CameraControlsPanel extends StatefulWidget {
     this.enabled = true,
     this.disabledHint,
     this.meterNote,
+    this.listenMode,
+    this.playbackVolume = 1.0,
+    this.audible = true,
+    this.audibleStates,
+    this.onListenModeChanged,
+    this.onVolumeChanged,
   });
 
   /// What the camera is set to right now.
@@ -90,12 +108,31 @@ class CameraControlsPanel extends StatefulWidget {
   /// reads its level off the outbound stream, so it needs a watcher.
   final String? meterNote;
 
+  /// What this phone plays. Null on the camera unit, which plays nothing —
+  /// the section is then hidden entirely.
+  final ListenMode? listenMode;
+
+  /// Playback volume on this phone, 0.0–1.0.
+  final double playbackVolume;
+
+  /// Whether the speaker is passing audio right now (filtered mode makes this
+  /// come and go — the UI says so, so a quiet phone never looks broken).
+  final bool audible;
+
+  /// Later changes to [audible], so the sheet stays honest while it is open.
+  final Stream<bool>? audibleStates;
+
+  final ValueChanged<ListenMode>? onListenModeChanged;
+  final ValueChanged<double>? onVolumeChanged;
+
   @override
   State<CameraControlsPanel> createState() => _CameraControlsPanelState();
 }
 
 class _CameraControlsPanelState extends State<CameraControlsPanel> {
   late CameraState _state;
+  late ListenMode? _mode = widget.listenMode;
+  late double _volume = widget.playbackVolume;
   StreamSubscription<CameraState>? _stateSub;
   bool _dragging = false;
 
@@ -266,6 +303,198 @@ class _CameraControlsPanelState extends State<CameraControlsPanel> {
             'and keeps it from creeping over the bar.',
           ),
           isThreeLine: true,
+        ),
+        const SizedBox(height: 8),
+        _HangSlider(
+          value: _sound.hang,
+          enabled: widget.enabled,
+          onDragStart: () => _dragging = true,
+          onPreview: (value) =>
+              _preview(_controls.copyWith(sound: _sound.copyWith(hang: value))),
+          onCommit: (value) {
+            _dragging = false;
+            _commit(_controls.copyWith(sound: _sound.copyWith(hang: value)));
+          },
+        ),
+        if (_mode != null) ...[
+          const SizedBox(height: 20),
+          _SectionLabel('Sound on this phone'),
+          const SizedBox(height: 8),
+          StreamBuilder<bool>(
+            stream: widget.audibleStates,
+            initialData: widget.audible,
+            builder: (context, snapshot) => _ListenModeSelector(
+              mode: _mode!,
+              audible: snapshot.data ?? widget.audible,
+              onChanged: (mode) {
+                setState(() => _mode = mode);
+                widget.onListenModeChanged?.call(mode);
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+          _VolumeSlider(
+            value: _volume,
+            enabled: _mode != ListenMode.muted,
+            onPreview: (value) => setState(() => _volume = value),
+            onCommit: widget.onVolumeChanged,
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// Which sounds actually reach *this* phone's speaker (F13). Per device, so
+/// one parent can filter while the other listens to everything.
+class _ListenModeSelector extends StatelessWidget {
+  const _ListenModeSelector({
+    required this.mode,
+    required this.audible,
+    required this.onChanged,
+  });
+
+  final ListenMode mode;
+  final bool audible;
+  final ValueChanged<ListenMode>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        SegmentedButton<ListenMode>(
+          segments: [
+            for (final value in ListenMode.values)
+              ButtonSegment(value: value, label: Text(value.label)),
+          ],
+          selected: {mode},
+          showSelectedIcon: false,
+          onSelectionChanged: onChanged == null
+              ? null
+              : (selection) => onChanged!(selection.first),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          switch (mode) {
+            ListenMode.filtered => audible
+                ? 'Playing — the room is above the bar.'
+                : 'Quiet: the room is below the bar, so nothing is played. '
+                    'Alerts and the picture still work.',
+            ListenMode.alwaysOn =>
+              'Everything the camera hears is played, snoring included.',
+            ListenMode.muted =>
+              'Nothing is played on this phone. Noise alerts and the picture '
+                  'still work.',
+          },
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: mode == ListenMode.muted
+                ? const Color(0xFFF59E0B)
+                : theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _VolumeSlider extends StatelessWidget {
+  const _VolumeSlider({
+    required this.value,
+    required this.enabled,
+    required this.onPreview,
+    required this.onCommit,
+  });
+
+  final double value;
+  final bool enabled;
+  final ValueChanged<double> onPreview;
+  final ValueChanged<double>? onCommit;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.speaker_outlined, size: 20),
+            const SizedBox(width: 10),
+            const Expanded(child: Text('Volume')),
+            Text(
+              '${(value * 100).round()}%',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+        Slider(
+          value: value.clamp(0.0, 1.0),
+          divisions: 20,
+          onChanged: enabled ? onPreview : null,
+          onChangeEnd: enabled ? onCommit : null,
+        ),
+      ],
+    );
+  }
+}
+
+/// How much of the tail of an event stays audible (F13 squelch hang time).
+class _HangSlider extends StatelessWidget {
+  const _HangSlider({
+    required this.value,
+    required this.enabled,
+    required this.onDragStart,
+    required this.onPreview,
+    required this.onCommit,
+  });
+
+  final Duration value;
+  final bool enabled;
+  final VoidCallback onDragStart;
+  final ValueChanged<Duration> onPreview;
+  final ValueChanged<Duration> onCommit;
+
+  static const int _maxSeconds = 120;
+  static const int _step = 5;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final seconds = value.inMilliseconds / 1000.0;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.hearing_outlined, size: 20),
+            const SizedBox(width: 10),
+            const Expanded(child: Text('Keep playing after it goes quiet')),
+            Text(
+              '${seconds.round()}s',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+        Slider(
+          value: seconds.clamp(0.0, _maxSeconds.toDouble()),
+          max: _maxSeconds.toDouble(),
+          divisions: _maxSeconds ~/ _step,
+          onChangeStart: enabled ? (_) => onDragStart() : null,
+          onChanged: enabled
+              ? (v) => onPreview(Duration(seconds: (v / _step).round() * _step))
+              : null,
+          onChangeEnd: enabled
+              ? (v) => onCommit(Duration(seconds: (v / _step).round() * _step))
+              : null,
+        ),
+        Text(
+          'Stops the speaker chattering on and off between sobs.',
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
         ),
       ],
     );

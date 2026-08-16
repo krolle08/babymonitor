@@ -96,6 +96,11 @@ class _ParentScreenState extends State<ParentScreen>
   );
   double _level = 0.0;
 
+  /// What this phone is doing with the camera's audio (F13).
+  ListenMode _listenMode = SettingsService.instance.listenMode;
+  double _volume = SettingsService.instance.playbackVolume;
+  bool _audible = true;
+
   bool _fullscreen = false;
   bool _chromeVisible = true;
   Timer? _chromeTimer;
@@ -191,6 +196,8 @@ class _ParentScreenState extends State<ParentScreen>
     _subs.add(session.transport.listen(_onTransport));
     _subs.add(session.cameraStates.listen(_onCameraState));
     _subs.add(session.audioLevels.listen(_onAudioLevel));
+    _subs.add(session.playbackAudible.listen(_onPlaybackChanged));
+    _audible = session.audible;
     await session.join(roomId); // never throws (NTR3)
     if (!mounted) return;
     setState(() {
@@ -239,6 +246,47 @@ class _ParentScreenState extends State<ParentScreen>
     if (mounted) setState(() => _level = level);
   }
 
+  void _onPlaybackChanged(bool audible) {
+    if (mounted) setState(() => _audible = audible);
+  }
+
+  // --- What this phone plays (F13) ---
+
+  Future<void> _setListenMode(ListenMode mode) async {
+    setState(() => _listenMode = mode);
+    await _session?.setListenMode(mode);
+    if (_session == null) await SettingsService.instance.setListenMode(mode);
+  }
+
+  Future<void> _setVolume(double volume) async {
+    setState(() => _volume = volume);
+    await _session?.setPlaybackVolume(volume);
+  }
+
+  /// Quick toggle in the chrome: filtered ⇆ always-on. "Muted" is deliberately
+  /// *not* in the cycle — silencing a baby monitor should take more than one
+  /// stray tap on a dark screen; it lives in the control sheet.
+  Future<void> _toggleListenMode() => _setListenMode(
+        _listenMode == ListenMode.alwaysOn
+            ? ListenMode.filtered
+            : ListenMode.alwaysOn,
+      );
+
+  IconData get _audioIcon => switch (_listenMode) {
+        ListenMode.muted => Icons.volume_off,
+        ListenMode.alwaysOn => Icons.volume_up,
+        ListenMode.filtered =>
+          _audible ? Icons.hearing : Icons.filter_list_outlined,
+      };
+
+  String get _audioTooltip => switch (_listenMode) {
+        ListenMode.muted => 'Muted on this phone',
+        ListenMode.alwaysOn => 'Playing everything — tap to filter',
+        ListenMode.filtered => _audible
+            ? 'Filtered: playing, the room is above the bar'
+            : 'Filtered: quiet — tap to hear everything',
+      };
+
   // --- Full screen (F14) ---
 
   void _setFullscreen(bool value) {
@@ -280,11 +328,15 @@ class _ParentScreenState extends State<ParentScreen>
       enabled: session?.canControlCamera ?? false,
       disabledHint: 'Waiting for the camera link — controls will work as soon '
           'as the stream is up.',
-      onPreview: (controls) => setState(() => _cameraState = CameraState(
-            controls: controls,
-            capabilities: _cameraState.capabilities,
-          )),
+      onPreview: (controls) =>
+          setState(() => _cameraState = _cameraState.copyWith(controls: controls)),
       onChanged: (controls) => session?.sendCameraControl(controls),
+      listenMode: _listenMode,
+      playbackVolume: _volume,
+      audible: _audible,
+      audibleStates: session?.playbackAudible,
+      onListenModeChanged: (mode) => unawaited(_setListenMode(mode)),
+      onVolumeChanged: (volume) => unawaited(_setVolume(volume)),
     );
   }
 
@@ -574,6 +626,11 @@ class _ParentScreenState extends State<ParentScreen>
             : AppBar(
                 title: Text(_roomLabel),
                 actions: [
+                  _AudioButton(
+                    mode: _listenMode,
+                    audible: _audible,
+                    onPressed: () => unawaited(_toggleListenMode()),
+                  ),
                   IconButton(
                     icon: const Icon(Icons.tune),
                     tooltip: 'Camera controls',
@@ -676,6 +733,13 @@ class _ParentScreenState extends State<ParentScreen>
                               child: Row(
                                 children: [
                                   _OverlayButton(
+                                    icon: _audioIcon,
+                                    tooltip: _audioTooltip,
+                                    onPressed: () =>
+                                        unawaited(_toggleListenMode()),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _OverlayButton(
                                     icon: Icons.tune,
                                     tooltip: 'Camera controls',
                                     onPressed: () =>
@@ -729,6 +793,43 @@ class _ParentScreenState extends State<ParentScreen>
           ),
         ),
       ),
+    );
+  }
+}
+
+/// App-bar button showing what this phone is playing (F13) — and, in filtered
+/// mode, whether the room is currently over the bar. One tap swaps between
+/// filtered and always-on; muting lives in the control sheet.
+class _AudioButton extends StatelessWidget {
+  const _AudioButton({
+    required this.mode,
+    required this.audible,
+    required this.onPressed,
+  });
+
+  final ListenMode mode;
+  final bool audible;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final muted = mode == ListenMode.muted;
+    return IconButton(
+      icon: Icon(switch (mode) {
+        ListenMode.muted => Icons.volume_off,
+        ListenMode.alwaysOn => Icons.volume_up,
+        ListenMode.filtered =>
+          audible ? Icons.hearing : Icons.filter_list_outlined,
+      }),
+      color: muted ? const Color(0xFFF59E0B) : null,
+      tooltip: switch (mode) {
+        ListenMode.muted => 'Muted on this phone',
+        ListenMode.alwaysOn => 'Playing everything — tap to filter',
+        ListenMode.filtered => audible
+            ? 'Filtered: playing, the room is above the bar'
+            : 'Filtered: quiet — tap to hear everything',
+      },
+      onPressed: onPressed,
     );
   }
 }

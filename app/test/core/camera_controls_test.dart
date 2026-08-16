@@ -12,6 +12,7 @@ void main() {
         threshold: 0.42,
         sustain: Duration(seconds: 6),
         ignoreSteady: false,
+        hang: Duration(seconds: 30),
       );
       expect(SoundFilter.fromJson(filter.toJson()), filter);
     });
@@ -21,11 +22,13 @@ void main() {
         threshold: 0.42,
         sustain: Duration(seconds: 6),
         ignoreSteady: false,
+        hang: Duration(seconds: 30),
       );
       final patched = filter.patch({'threshold': 0.60});
       expect(patched.threshold, 0.60);
       expect(patched.sustain, const Duration(seconds: 6));
       expect(patched.ignoreSteady, isFalse);
+      expect(patched.hang, const Duration(seconds: 30));
     });
 
     test('malformed and out-of-range values are ignored or clamped', () {
@@ -40,6 +43,36 @@ void main() {
       expect(filter.patch({'sustainMs': 999999}).sustain,
           AppConfig.maxNoiseSustain);
       expect(filter.patch({'sustainMs': -5}).sustain, Duration.zero);
+      expect(filter.patch({'hangMs': 999999}).hang, AppConfig.maxAudioHang);
+      expect(filter.patch({'hangMs': -1}).hang, Duration.zero);
+    });
+  });
+
+  group('ListenMode', () {
+    test('round-trips through its stored id', () {
+      for (final mode in ListenMode.values) {
+        expect(ListenMode.parse(mode.id), mode);
+      }
+    });
+
+    test('an unknown or missing id falls back to filtered', () {
+      expect(ListenMode.parse(null), ListenMode.filtered);
+      expect(ListenMode.parse('whisper'), ListenMode.filtered);
+    });
+  });
+
+  group('CameraState gate', () {
+    test('carries the squelch state so a new parent knows at once', () {
+      const state = CameraState(
+        controls: CameraControls.defaults,
+        capabilities: CameraCapabilities.none,
+        gateOpen: true,
+      );
+      expect(CameraState.fromJson(state.toJson()).gateOpen, isTrue);
+    });
+
+    test('defaults to closed when the field is absent', () {
+      expect(CameraState.fromJson(const {}).gateOpen, isFalse);
     });
   });
 

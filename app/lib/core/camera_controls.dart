@@ -24,6 +24,7 @@ class SoundFilter {
     this.threshold = AppConfig.defaultNoiseThreshold,
     this.sustain = AppConfig.defaultNoiseSustain,
     this.ignoreSteady = AppConfig.defaultIgnoreSteadySound,
+    this.hang = AppConfig.defaultAudioHang,
   });
 
   /// Level 0.0–1.0 a sound must reach before it counts at all — the "bar".
@@ -38,23 +39,31 @@ class SoundFilter {
   /// (breathing, a fan, a white-noise machine) — see [NoiseGate].
   final bool ignoreSteady;
 
+  /// How long the parent keeps hearing the room after it falls quiet again.
+  /// This is the squelch's hang time: it decides how much of the *tail* of an
+  /// event is played, not whether the event counts.
+  final Duration hang;
+
   static const SoundFilter defaults = SoundFilter();
 
   SoundFilter copyWith({
     double? threshold,
     Duration? sustain,
     bool? ignoreSteady,
+    Duration? hang,
   }) =>
       SoundFilter(
         threshold: threshold ?? this.threshold,
         sustain: sustain ?? this.sustain,
         ignoreSteady: ignoreSteady ?? this.ignoreSteady,
+        hang: hang ?? this.hang,
       );
 
   Map<String, dynamic> toJson() => {
         'threshold': threshold,
         'sustainMs': sustain.inMilliseconds,
         'ignoreSteady': ignoreSteady,
+        'hangMs': hang.inMilliseconds,
       };
 
   /// Applies the fields present in [json]; anything missing or malformed keeps
@@ -63,6 +72,7 @@ class SoundFilter {
     final threshold = json['threshold'];
     final sustainMs = json['sustainMs'];
     final ignoreSteady = json['ignoreSteady'];
+    final hangMs = json['hangMs'];
     return SoundFilter(
       threshold: threshold is num
           ? _clampDouble(threshold, AppConfig.minNoiseThreshold,
@@ -75,6 +85,11 @@ class SoundFilter {
                   .clamp(0, AppConfig.maxNoiseSustain.inMilliseconds))
           : sustain,
       ignoreSteady: ignoreSteady is bool ? ignoreSteady : this.ignoreSteady,
+      hang: hangMs is num
+          ? Duration(
+              milliseconds:
+                  hangMs.toInt().clamp(0, AppConfig.maxAudioHang.inMilliseconds))
+          : hang,
     );
   }
 
@@ -86,14 +101,46 @@ class SoundFilter {
       other is SoundFilter &&
       other.threshold == threshold &&
       other.sustain == sustain &&
-      other.ignoreSteady == ignoreSteady;
+      other.ignoreSteady == ignoreSteady &&
+      other.hang == hang;
 
   @override
-  int get hashCode => Object.hash(threshold, sustain, ignoreSteady);
+  int get hashCode => Object.hash(threshold, sustain, ignoreSteady, hang);
 
   @override
   String toString() => 'SoundFilter(threshold: $threshold, '
-      'sustain: ${sustain.inMilliseconds}ms, ignoreSteady: $ignoreSteady)';
+      'sustain: ${sustain.inMilliseconds}ms, ignoreSteady: $ignoreSteady, '
+      'hang: ${hang.inMilliseconds}ms)';
+}
+
+/// What a parent device does with the camera's audio (F13).
+///
+/// The filter decides *what counts*; this decides how much of that reaches
+/// the speaker on this particular phone — mum can filter while dad listens
+/// to everything.
+enum ListenMode {
+  /// Play the room only while the camera's gate is open — the default, and
+  /// the answer to "don't play snoring at me all night".
+  filtered('filtered', 'Filtered'),
+
+  /// Play everything, snoring included (classic monitor behaviour).
+  alwaysOn('always', 'Always on'),
+
+  /// Play nothing. Alerts and the picture still work.
+  muted('muted', 'Muted');
+
+  const ListenMode(this.id, this.label);
+
+  /// Stable identifier for storage.
+  final String id;
+
+  /// Short human label for the UI.
+  final String label;
+
+  static ListenMode parse(String? id) => values.firstWhere(
+        (mode) => mode.id == id,
+        orElse: () => filtered,
+      );
 }
 
 /// Everything a parent can change about the camera while watching (F15).
@@ -202,19 +249,29 @@ class CameraCapabilities {
 
 /// A `camera-state` broadcast: what the camera is doing + what it can do.
 class CameraState {
-  const CameraState({required this.controls, required this.capabilities});
+  const CameraState({
+    required this.controls,
+    required this.capabilities,
+    this.gateOpen = false,
+  });
 
   final CameraControls controls;
   final CameraCapabilities capabilities;
 
+  /// Whether the sound gate is open right now — carried so a parent that has
+  /// just connected knows immediately whether to play the room.
+  final bool gateOpen;
+
   Map<String, dynamic> toJson() => {
         'controls': controls.toJson(),
         'caps': capabilities.toJson(),
+        'gateOpen': gateOpen,
       };
 
   static CameraState fromJson(Map<String, dynamic> json) {
     final controls = json['controls'];
     final caps = json['caps'];
+    final gateOpen = json['gateOpen'];
     return CameraState(
       controls: controls is Map<String, dynamic>
           ? CameraControls.fromJson(controls)
@@ -222,17 +279,30 @@ class CameraState {
       capabilities: caps is Map<String, dynamic>
           ? CameraCapabilities.fromJson(caps)
           : CameraCapabilities.none,
+      gateOpen: gateOpen is bool ? gateOpen : false,
     );
   }
+
+  CameraState copyWith({
+    CameraControls? controls,
+    CameraCapabilities? capabilities,
+    bool? gateOpen,
+  }) =>
+      CameraState(
+        controls: controls ?? this.controls,
+        capabilities: capabilities ?? this.capabilities,
+        gateOpen: gateOpen ?? this.gateOpen,
+      );
 
   @override
   bool operator ==(Object other) =>
       other is CameraState &&
       other.controls == controls &&
-      other.capabilities == capabilities;
+      other.capabilities == capabilities &&
+      other.gateOpen == gateOpen;
 
   @override
-  int get hashCode => Object.hash(controls, capabilities);
+  int get hashCode => Object.hash(controls, capabilities, gateOpen);
 }
 
 /// The 4x5 colour matrix (20 values, row-major, offsets in 0–255) that renders

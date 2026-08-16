@@ -27,7 +27,15 @@ void main() {
     Stream<CameraState>? states,
     Stream<double>? levels,
     bool enabled = true,
+    ListenMode? listenMode,
+    bool audible = true,
+    Stream<bool>? audibleStates,
+    ValueChanged<ListenMode>? onListenModeChanged,
   }) async {
+    // A tall surface so the whole panel is built and hit-testable — the
+    // sound-on-this-phone section sits below a phone-sized fold.
+    await tester.binding.setSurfaceSize(const Size(800, 2400));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
@@ -37,6 +45,10 @@ void main() {
             levels: levels,
             onChanged: onChanged,
             enabled: enabled,
+            listenMode: listenMode,
+            audible: audible,
+            audibleStates: audibleStates,
+            onListenModeChanged: onListenModeChanged,
           ),
         ),
       ),
@@ -143,6 +155,78 @@ void main() {
       await tester.pump();
       expect(find.text('Now 62%'), findsOneWidget);
       expect(find.text('above the bar — alerts'), findsOneWidget);
+    });
+  });
+
+  // F13 — what actually reaches this phone's speaker.
+  group('CameraControlsPanel playback', () {
+    testWidgets('the camera unit gets no "sound on this phone" section',
+        (tester) async {
+      await pumpPanel(tester, state: withTorch, onChanged: (_) {});
+      expect(find.text('SOUND ON THIS PHONE'), findsNothing);
+      expect(find.text('Filtered'), findsNothing);
+    });
+
+    testWidgets('a parent can switch to always-on', (tester) async {
+      ListenMode? chosen;
+      await pumpPanel(
+        tester,
+        state: withTorch,
+        onChanged: (_) {},
+        listenMode: ListenMode.filtered,
+        onListenModeChanged: (mode) => chosen = mode,
+      );
+
+      await tester.tap(find.text('Always on'));
+      await tester.pump();
+
+      expect(chosen, ListenMode.alwaysOn);
+      expect(
+        find.textContaining('Everything the camera hears is played'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('filtered mode explains a quiet speaker, live', (tester) async {
+      final audibleStates = StreamController<bool>.broadcast();
+      addTearDown(audibleStates.close);
+      await pumpPanel(
+        tester,
+        state: withTorch,
+        onChanged: (_) {},
+        listenMode: ListenMode.filtered,
+        audible: true,
+        audibleStates: audibleStates.stream,
+      );
+
+      expect(find.textContaining('Playing — the room is above the bar'),
+          findsOneWidget);
+
+      // The room settles: the speaker goes quiet, and the panel says why.
+      audibleStates.add(false);
+      await tester.pump();
+      expect(
+        find.textContaining('the room is below the bar, so nothing is played'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('muted is called out as the risky mode it is', (tester) async {
+      await pumpPanel(
+        tester,
+        state: withTorch,
+        onChanged: (_) {},
+        listenMode: ListenMode.muted,
+        onListenModeChanged: (_) {},
+      );
+
+      expect(
+        find.textContaining('Nothing is played on this phone'),
+        findsOneWidget,
+      );
+      // Alerts must still be promised, not silently dropped.
+      expect(find.textContaining('Noise alerts and the picture still work'),
+          findsOneWidget);
     });
   });
 }

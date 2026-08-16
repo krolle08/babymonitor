@@ -65,6 +65,10 @@ class _CameraScreenState extends State<CameraScreen> {
   );
   double _level = 0.0;
 
+  /// Whether the room is currently passing the filter — i.e. whether parents
+  /// are hearing anything at all right now (F13).
+  bool _gateOpen = false;
+
   bool _fullscreen = false;
   bool _chromeVisible = true;
   Timer? _chromeTimer;
@@ -100,6 +104,9 @@ class _CameraScreenState extends State<CameraScreen> {
     }));
     _subs.add(_session.audioLevels.listen((level) {
       if (mounted) setState(() => _level = level);
+    }));
+    _subs.add(_session.audioGate.listen((open) {
+      if (mounted) setState(() => _gateOpen = open);
     }));
   }
 
@@ -228,10 +235,8 @@ class _CameraScreenState extends State<CameraScreen> {
       enabled: _phase == _Phase.running,
       disabledHint: 'The camera is not running yet.',
       meterNote: _meterNote,
-      onPreview: (controls) => setState(() => _cameraState = CameraState(
-            controls: controls,
-            capabilities: _cameraState.capabilities,
-          )),
+      onPreview: (controls) =>
+          setState(() => _cameraState = _cameraState.copyWith(controls: controls)),
       onChanged: (controls) => unawaited(_session.applyControls(controls)),
     );
   }
@@ -470,6 +475,8 @@ class _CameraScreenState extends State<CameraScreen> {
             level: _level,
             filter: _cameraState.controls.sound,
             note: _meterNote,
+            gateOpen: _gateOpen,
+            playingTo: _parentCount,
             onAdjust: () => unawaited(_openControls()),
           ),
           const SizedBox(height: 12),
@@ -511,12 +518,20 @@ class _SoundFilterCard extends StatelessWidget {
     required this.level,
     required this.filter,
     required this.onAdjust,
+    required this.gateOpen,
+    required this.playingTo,
     this.note,
   });
 
   final double level;
   final SoundFilter filter;
   final VoidCallback onAdjust;
+
+  /// Whether the room currently passes the filter and is being played.
+  final bool gateOpen;
+
+  /// How many parents are connected — nobody is hearing anything at zero.
+  final int playingTo;
 
   /// Why the meter is not moving, when it is not moving.
   final String? note;
@@ -541,6 +556,25 @@ class _SoundFilterCard extends StatelessWidget {
                     letterSpacing: 1.5,
                   ),
                 ),
+                if (playingTo > 0) ...[
+                  const SizedBox(width: 8),
+                  Icon(
+                    gateOpen ? Icons.hearing : Icons.hearing_disabled,
+                    size: 14,
+                    color: gateOpen
+                        ? const Color(0xFF10B981)
+                        : theme.colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    gateOpen ? 'playing' : 'not played',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: gateOpen
+                          ? const Color(0xFF10B981)
+                          : theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
                 const Spacer(),
                 TextButton.icon(
                   onPressed: onAdjust,

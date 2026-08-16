@@ -41,6 +41,11 @@ an alert (spec NTR1).
   alerts, and steady-background rejection that learns the room's quiet level so
   breathing or a fan cannot creep over the bar. The floor is only ever learned from
   sound *below* the bar, so a long cry can never train it into silence.
+  What the filter ignores is also **not played**: the parent's speaker only opens
+  while the gate is open, with a hang time so the tail of a real cry is never
+  clipped. Each parent phone picks its own listen mode — *Filtered*, *Always on* or
+  *Muted* — and if gate news goes stale the audio opens back up rather than leaving
+  anyone deaf.
 - **Full screen (F14):** both units. The camera preview goes full screen so you can
   check the framing from the doorway; the parent stream goes full screen with chrome
   that fades after 4 s and comes back on a tap. Landscape works in both.

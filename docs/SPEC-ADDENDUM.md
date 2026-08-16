@@ -127,7 +127,9 @@ not even the signaling server has to be trusted.
 
 **Purpose:** A parent should be woken by a baby who needs them, not by snoring,
 breathing, a cough or the fan. F7's single level threshold is not enough: the loudest
-sound in a nursery at 3 a.m. is often the one you least want an alert for.
+sound in a nursery at 3 a.m. is often the one you least want an alert for. And an
+ignored sound must not be *played* either — filtering the alert while the speaker
+still carries the snoring is not filtering at all.
 
 **Behaviour:**
 - Three independent filters on the camera's noise gate (PROTOCOL §5.2), because
@@ -142,6 +144,18 @@ sound in a nursery at 3 a.m. is often the one you least want an alert for.
      machine cannot creep over the bar.
 - The gate learns its quiet floor **only from sound below the bar**, so a long cry can
   never train it into silence (NTR1).
+- **The filter governs the speaker, not just the alert** (the squelch, PROTOCOL §4.2):
+  the parent's phone plays the room only while the gate is open, and keeps playing for
+  a configurable hang time (default 15 s) after it goes quiet, so the tail of a real
+  event is never clipped and the speaker does not chatter between sobs. The audio
+  track keeps flowing — only playback is gated — so re-opening is instant.
+- Each parent device chooses its own **listen mode**: *Filtered* (default), *Always
+  on* (everything, classic monitor) or *Muted*. Mum can filter while dad listens to
+  everything. Plus a playback volume per device.
+- **Silence is never the failure mode:** if a parent has heard nothing about the gate
+  for 10 s — dead channel, camera gone — the audio opens back up and stays open.
+- The parent UI always says *why* it is quiet ("the room is below the bar"), so a
+  filtered monitor is never mistaken for a broken one.
 - Adjustable from the camera unit *and* live from a watching parent (F15 transport),
   with the same live level meter on both, so you can watch the baby breathe and put
   the bar just above it.
@@ -164,6 +178,14 @@ a loopback peer connection purely for stats, which the old camera phone cannot a
       unit while watching, and take effect on the camera's next sample
 - [ ] The live meter shows the current level against the bar in force on both units,
       and explains itself when there is nothing to sample
+- [ ] Snoring is **not played** on the parent phone in the default filtered mode
+- [ ] Crying is played, and stays played through pauses and through the 30 s alert
+      cooldown, until the room has been quiet for the hang time
+- [ ] Switching a parent to "Always on" plays everything immediately; "Muted" plays
+      nothing while alerts and the picture keep working
+- [ ] Killing the data channel while the speaker is filtered-quiet opens the audio
+      within 10 s rather than leaving that phone deaf
+- [ ] One parent on "Always on" does not change what the other parent hears
 
 ---
 

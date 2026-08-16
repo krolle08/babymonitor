@@ -58,8 +58,11 @@ class SettingsService {
   static const _kNoiseThreshold = 'noiseThreshold'; // custom bar, F13
   static const _kNoiseSustainMs = 'noiseSustainMs';
   static const _kIgnoreSteadySound = 'ignoreSteadySound';
+  static const _kAudioHangMs = 'audioHangMs';
   static const _kCameraBrightness = 'cameraBrightness'; // F15
   static const _kCameraNightMode = 'cameraNightMode';
+  static const _kListenMode = 'listenMode'; // F13, per parent device
+  static const _kPlaybackVolume = 'playbackVolume';
 
   static String _generateDeviceId() {
     final rng = Random.secure();
@@ -163,11 +166,20 @@ class SettingsService {
   bool get ignoreSteadySound =>
       _prefs.getBool(_kIgnoreSteadySound) ?? AppConfig.defaultIgnoreSteadySound;
 
+  /// How long parents keep hearing the room after it goes quiet (squelch hang).
+  Duration get audioHang {
+    final ms = _prefs.getInt(_kAudioHangMs);
+    if (ms == null) return AppConfig.defaultAudioHang;
+    return Duration(
+        milliseconds: ms.clamp(0, AppConfig.maxAudioHang.inMilliseconds));
+  }
+
   /// The complete sound filter the camera's noise gate runs with (F13).
   SoundFilter get soundFilter => SoundFilter(
         threshold: noiseThreshold,
         sustain: noiseSustain,
         ignoreSteady: ignoreSteadySound,
+        hang: audioHang,
       );
 
   Future<void> setSoundFilter(SoundFilter filter) async {
@@ -178,7 +190,32 @@ class SettingsService {
           .clamp(0, AppConfig.maxNoiseSustain.inMilliseconds),
     );
     await _prefs.setBool(_kIgnoreSteadySound, filter.ignoreSteady);
+    await _prefs.setInt(
+      _kAudioHangMs,
+      filter.hang.inMilliseconds.clamp(0, AppConfig.maxAudioHang.inMilliseconds),
+    );
   }
+
+  // --- Audio playback on this device (F13) ---
+
+  /// What this phone does with the camera's audio. Local to the device, so
+  /// one parent can filter while the other listens to everything.
+  ListenMode get listenMode =>
+      ListenMode.parse(_prefs.getString(_kListenMode) ??
+          AppConfig.defaultListenMode);
+
+  Future<void> setListenMode(ListenMode mode) =>
+      _prefs.setString(_kListenMode, mode.id);
+
+  /// Playback volume for the camera's audio on this phone, 0.0–1.0.
+  double get playbackVolume {
+    final value = _prefs.getDouble(_kPlaybackVolume);
+    if (value == null || !value.isFinite) return 1.0;
+    return value.clamp(0.0, 1.0).toDouble();
+  }
+
+  Future<void> setPlaybackVolume(double value) =>
+      _prefs.setDouble(_kPlaybackVolume, value.clamp(0.0, 1.0).toDouble());
 
   // --- Camera image controls (F15) ---
 

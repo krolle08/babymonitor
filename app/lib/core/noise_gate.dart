@@ -32,6 +32,7 @@ class NoiseGate {
     required this.cooldown,
     this.sustain = Duration.zero,
     this.ignoreSteady = false,
+    this.hang = AppConfig.defaultAudioHang,
     this.steadyMargin = AppConfig.steadySoundMargin,
     this.floorAlpha = AppConfig.quietFloorAlpha,
   });
@@ -43,6 +44,7 @@ class NoiseGate {
         cooldown: cooldown,
         sustain: filter.sustain,
         ignoreSteady: filter.ignoreSteady,
+        hang: filter.hang,
       );
 
   /// Minimum time between fires (F7 AC: no duplicate alerts within 30 s).
@@ -65,8 +67,14 @@ class NoiseGate {
   /// How far above the quiet floor a sound must be when [ignoreSteady] is on.
   double steadyMargin;
 
+  /// How long [open] stays true after the room goes quiet again, so the
+  /// parent's speaker does not chatter on and off between sobs.
+  Duration hang;
+
   DateTime? _lastFiredAt;
   DateTime? _loudSince;
+  DateTime? _quietSince;
+  bool _open = false;
   double _quietFloor = 0.0;
 
   /// When the gate last fired, or null if it never has.
@@ -85,23 +93,37 @@ class NoiseGate {
       ? math.max(threshold, _quietFloor + steadyMargin)
       : threshold;
 
+  /// Whether the room currently counts as "something is happening" (F13).
+  ///
+  /// This is the **squelch**: it opens on the same decision that raises an
+  /// alert and stays open for [hang] after the room goes quiet, so parents
+  /// hear the event — and only the event — instead of a night of snoring.
+  /// Unlike [feed]'s return value it is a *state*, not an edge: the 30 s
+  /// alert cooldown does not close it.
+  bool get open => _open;
+
   /// Feed one audio-level sample. Returns true (and starts the cooldown) when
   /// the sample clears [effectiveThreshold], has been clearing it for
-  /// [sustain], and the cooldown has elapsed since the last fire.
+  /// [sustain], and the cooldown has elapsed since the last fire. Also updates
+  /// [open], which drives what the parent actually hears.
   bool feed(double level, DateTime now) {
-    if (level < threshold) {
-      // Quiet: forget the run and let the floor learn this sample. Learning
-      // only from sub-threshold sound is deliberate — see the class doc.
+    // Learning the floor only from sub-threshold sound is deliberate — see
+    // the class doc.
+    if (level < threshold) _quietFloor += floorAlpha * (level - _quietFloor);
+    final loud = level >= threshold &&
+        (!ignoreSteady || level >= _quietFloor + steadyMargin);
+
+    if (!loud) {
       _loudSince = null;
-      _quietFloor += floorAlpha * (level - _quietFloor);
+      final quietSince = _quietSince ??= now;
+      if (_open && now.difference(quietSince) >= hang) _open = false;
       return false;
     }
-    if (ignoreSteady && level < _quietFloor + steadyMargin) {
-      _loudSince = null; // steady background, not an event
-      return false;
-    }
+
+    _quietSince = null;
     final since = _loudSince ??= now;
     if (now.difference(since) < sustain) return false; // not long enough yet
+    _open = true;
     final last = _lastFiredAt;
     if (last != null && now.difference(last) < cooldown) return false;
     _lastFiredAt = now;
@@ -109,18 +131,22 @@ class NoiseGate {
   }
 
   /// Applies a new filter live (F7 AC: settings changes take effect on the
-  /// next sample). The cooldown and the learned floor are kept — the room did
-  /// not change, only the bar did.
+  /// next sample). The cooldown, the learned floor and the current [open]
+  /// state are kept — the room did not change, only the bar did.
   void applyFilter(SoundFilter filter) {
     threshold = filter.threshold;
     sustain = filter.sustain;
     ignoreSteady = filter.ignoreSteady;
+    hang = filter.hang;
   }
 
-  /// Clear the cooldown, the sustain run and the learned floor (fresh session).
+  /// Clear the cooldown, the sustain run, the squelch and the learned floor
+  /// (fresh session).
   void reset() {
     _lastFiredAt = null;
     _loudSince = null;
+    _quietSince = null;
+    _open = false;
     _quietFloor = 0.0;
   }
 }

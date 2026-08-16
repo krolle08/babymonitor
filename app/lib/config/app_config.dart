@@ -44,6 +44,18 @@ class AppConfig {
   /// settle at the 1 s sampling interval).
   static const double quietFloorAlpha = 0.05;
 
+  /// How long the parent keeps hearing the room after it goes quiet again
+  /// (the squelch's hang time — stops the speaker chattering between sobs).
+  static const Duration defaultAudioHang = Duration(seconds: 15);
+  static const Duration maxAudioHang = Duration(seconds: 120);
+
+  /// A parent whose gate news is older than this stops trusting the squelch
+  /// and opens the audio (NTR1: never go silently deaf).
+  static const Duration audioGateStaleAfter = Duration(seconds: 10);
+
+  /// Playback modes for the camera's audio on a parent device.
+  static const String defaultListenMode = 'filtered';
+
   // --- Camera image controls (F15) ---
   /// Capture frame rate: normal, and in night mode (lower = longer exposure
   /// per frame, so a dim room is visibly brighter).

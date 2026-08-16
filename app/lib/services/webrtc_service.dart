@@ -182,6 +182,7 @@ class CameraSession {
       StreamController<CameraState>.broadcast();
   final StreamController<double> _audioLevels =
       StreamController<double>.broadcast();
+  final StreamController<bool> _audioGate = StreamController<bool>.broadcast();
 
   CameraControls _controls = CameraControls.defaults;
   CameraCapabilities _capabilities = CameraCapabilities.none;
@@ -190,6 +191,7 @@ class CameraSession {
   NoiseMonitor? _noiseMonitor;
   Timer? _hbTimer;
   StreamSubscription<double>? _levelSub;
+  StreamSubscription<bool>? _gateSub;
   StreamSubscription<Map<String, dynamic>>? _cloudMsgSub;
   StreamSubscription<bool>? _cloudConnSub;
   StreamSubscription<Map<String, dynamic>>? _lanMsgSub;
@@ -218,14 +220,23 @@ class CameraSession {
   /// Live sampled audio level (0.0–1.0) for the on-camera meter (F13).
   Stream<double> get audioLevels => _audioLevels.stream;
 
+  /// Squelch transitions (F13) — what the parents are hearing right now.
+  Stream<bool> get audioGate => _audioGate.stream;
+
+  /// Whether the room currently passes the filter.
+  bool get audioGateOpen => _noiseMonitor?.gateOpen ?? false;
+
   /// Current image + sound-filter settings.
   CameraControls get controls => _controls;
 
   /// What this camera's hardware supports (torch, …).
   CameraCapabilities get capabilities => _capabilities;
 
-  CameraState get cameraState =>
-      CameraState(controls: _controls, capabilities: _capabilities);
+  CameraState get cameraState => CameraState(
+        controls: _controls,
+        capabilities: _capabilities,
+        gateOpen: _noiseMonitor?.gateOpen ?? false,
+      );
 
   /// The 6-char cloud room code once `room-created` arrives (null on pure LAN).
   String? get roomId => _roomId;
@@ -299,6 +310,9 @@ class CameraSession {
     _levelSub = monitor.levels.listen((level) {
       if (!_audioLevels.isClosed) _audioLevels.add(level);
     });
+    // The squelch (F13): tell every parent the moment the room becomes worth
+    // listening to, and the moment it stops being.
+    _gateSub = monitor.gateStates.listen(_onGateChanged);
     monitor.start();
     _emitCameraState();
 
@@ -496,6 +510,22 @@ class CameraSession {
     });
     final tracks = captured.getVideoTracks();
     return tracks.isEmpty ? null : tracks.first;
+  }
+
+  /// The squelch opened or closed (F13): every parent is told at once so what
+  /// the filter ignores is never played, and the tail of a real event is.
+  /// Sent on the data channel *and* stamped into every heartbeat, so a parent
+  /// that missed the edge resyncs within one heartbeat.
+  void _onGateChanged(bool open) {
+    if (!_audioGate.isClosed) _audioGate.add(open);
+    final message = {
+      't': 'audio-gate',
+      'open': open,
+      'ts': _now().millisecondsSinceEpoch,
+    };
+    for (final peer in _peers.values) {
+      _channelSend(peer.channel, message);
+    }
   }
 
   /// Publishes the current state locally (camera UI) and to every parent that
@@ -869,7 +899,14 @@ class CameraSession {
     _hbSeq++;
     final ts = _now().millisecondsSinceEpoch;
     final level = _noiseMonitor?.lastLevel ?? 0.0;
-    final channelMsg = {'t': 'hb', 'seq': _hbSeq, 'ts': ts, 'audioLevel': level};
+    final gateOpen = _noiseMonitor?.gateOpen ?? false;
+    final channelMsg = {
+      't': 'hb',
+      'seq': _hbSeq,
+      'ts': ts,
+      'audioLevel': level,
+      'gateOpen': gateOpen,
+    };
     // §2.3: fall back to signaling relay per transport whose peers lack an open
     // data channel (each transport fans out to its own parents).
     final fallbackTx = <String, _CameraTransport>{};
@@ -885,7 +922,8 @@ class CameraSession {
         'type': 'hb',
         'seq': _hbSeq,
         'ts': ts,
-        'audioLevel': level
+        'audioLevel': level,
+        'gateOpen': gateOpen,
       };
       for (final tx in fallbackTx.values) {
         tx.send(sigMsg);
@@ -976,6 +1014,8 @@ class CameraSession {
     _hbTimer = null;
     await _levelSub?.cancel();
     _levelSub = null;
+    await _gateSub?.cancel();
+    _gateSub = null;
     final monitor = _noiseMonitor;
     _noiseMonitor = null;
     await monitor?.dispose();
@@ -1049,6 +1089,7 @@ class CameraSession {
     await _parentCount.close();
     await _cameraStates.close();
     await _audioLevels.close();
+    await _audioGate.close();
   }
 
   void _warn(String message) {
@@ -1140,9 +1181,20 @@ class ParentSession {
       StreamController<CameraState>.broadcast();
   final StreamController<double> _audioLevels =
       StreamController<double>.broadcast();
+  final StreamController<bool> _playback = StreamController<bool>.broadcast();
   final Set<int> _seenNoiseTs = <int>{};
 
   CameraState? _cameraState;
+
+  /// What this phone does with the camera's audio (F13). Local to the device:
+  /// one parent can filter while the other listens to everything.
+  late ListenMode _listenMode = _prefs.listenMode;
+
+  /// Last squelch state the camera reported, and when it said so. Unknown or
+  /// stale means *audible* — a parent must never go silently deaf (NTR1).
+  bool _gateOpen = true;
+  DateTime? _gateAt;
+  bool _audible = true;
 
   RTCPeerConnection? _pc;
   RTCDataChannel? _channel;
@@ -1208,6 +1260,88 @@ class ParentSession {
   /// `health` channel (§4), so they need an open channel, not just a picture.
   bool get canControlCamera =>
       _channel?.state == RTCDataChannelState.RTCDataChannelOpen;
+
+  // --- Audio playback (F13 squelch) ---
+
+  /// Emits whenever the speaker starts or stops playing the room, so the UI
+  /// can say *why* it is quiet instead of looking broken.
+  Stream<bool> get playbackAudible => _playback.stream;
+
+  /// Whether the camera's audio is reaching this phone's speaker right now.
+  bool get audible => _audible;
+
+  /// This device's listen mode.
+  ListenMode get listenMode => _listenMode;
+
+  /// The camera's squelch as last reported (true when unknown — fail loud).
+  bool get gateOpen => _gateOpen;
+
+  /// Switches what this phone plays (F13). Takes effect immediately.
+  Future<void> setListenMode(ListenMode mode) async {
+    _listenMode = mode;
+    await _prefs.setListenMode(mode);
+    _applyPlayback();
+  }
+
+  /// Playback volume for the camera's audio on this phone, 0.0–1.0.
+  Future<void> setPlaybackVolume(double volume) async {
+    final value = volume.clamp(0.0, 1.0).toDouble();
+    await _prefs.setPlaybackVolume(value);
+    await _applyVolume(value);
+  }
+
+  void _onGateMessage(Object? open) {
+    if (open is! bool) return;
+    _gateOpen = open;
+    _gateAt = _now();
+    _applyPlayback();
+  }
+
+  /// True when the camera's squelch news is too old to trust — a dead data
+  /// channel must open the audio, never silence it.
+  bool get _gateStale {
+    final at = _gateAt;
+    if (at == null) return true;
+    return _now().difference(at) > AppConfig.audioGateStaleAfter;
+  }
+
+  /// Mutes or unmutes the incoming audio track. Disabling a *received* track
+  /// stops it reaching the speaker while the stream itself keeps flowing, so
+  /// re-opening is instant — no renegotiation, nothing to miss.
+  void _applyPlayback({bool force = false}) {
+    final audible = switch (_listenMode) {
+      ListenMode.alwaysOn => true,
+      ListenMode.muted => false,
+      ListenMode.filtered => _gateOpen || _gateStale,
+    };
+    if (audible == _audible && !force) return; // nothing to do (called at 1 Hz)
+    final stream = _remoteStream;
+    if (stream != null) {
+      try {
+        for (final track in stream.getAudioTracks()) {
+          track.enabled = audible;
+        }
+      } catch (e) {
+        debugPrint('ParentSession: toggling playback failed: $e');
+      }
+    }
+    if (audible != _audible) {
+      _audible = audible;
+      if (!_playback.isClosed) _playback.add(audible);
+    }
+  }
+
+  Future<void> _applyVolume(double volume) async {
+    final stream = _remoteStream;
+    if (stream == null) return;
+    try {
+      for (final track in stream.getAudioTracks()) {
+        await Helper.setVolume(volume, track);
+      }
+    } catch (e) {
+      debugPrint('ParentSession: setVolume failed: $e');
+    }
+  }
 
   /// Stream latency measured at connect: heartbeat `ts` vs local clock,
   /// clamped >= 0 (F1 — alert when it exceeds [AppConfig.latencyAlertMs]).
@@ -1302,8 +1436,13 @@ class ParentSession {
         _joinInFlight = false;
       }
     });
-    _tickTimer ??= Timer.periodic(
-        const Duration(seconds: 1), (_) => healthMonitor.tick());
+    _tickTimer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      healthMonitor.tick();
+      // Re-evaluates the squelch: if the camera's gate news went stale the
+      // audio opens back up here (NTR1 — never silently deaf). No-op when
+      // nothing changed.
+      _applyPlayback();
+    });
     _statsTimer ??= Timer.periodic(AppConfig.freezeSampleInterval, (_) {
       unawaited(_sampleStats());
     });
@@ -1360,6 +1499,7 @@ class ParentSession {
           final ts = msg['ts'];
           if (seq is num && ts is num) _onHeartbeat(seq.toInt(), ts.toInt());
           _onAudioLevel(msg['audioLevel']);
+          _onGateMessage(msg['gateOpen']);
         case 'noise':
           final ts = msg['ts'];
           final level = msg['audioLevel'];
@@ -1521,9 +1661,17 @@ class ParentSession {
       });
     };
     pc.onTrack = (event) {
-      if (event.streams.isNotEmpty && event.track.kind == 'video') {
-        _remoteStream = event.streams.first;
-        if (!_remoteStreams.isClosed) _remoteStreams.add(event.streams.first);
+      if (event.streams.isEmpty) return;
+      final stream = event.streams.first;
+      if (event.track.kind == 'video') {
+        _remoteStream = stream;
+        if (!_remoteStreams.isClosed) _remoteStreams.add(stream);
+      } else if (event.track.kind == 'audio') {
+        // The squelch (F13) lives here: a received audio track that is not
+        // enabled never reaches the speaker.
+        _remoteStream ??= stream;
+        _applyPlayback(force: true);
+        unawaited(_applyVolume(_prefs.playbackVolume));
       }
     };
     pc.onDataChannel = (channel) {
@@ -1590,6 +1738,9 @@ class ParentSession {
         final ts = msg['ts'];
         if (seq is num && ts is num) _onHeartbeat(seq.toInt(), ts.toInt());
         _onAudioLevel(msg['audioLevel']);
+        _onGateMessage(msg['gateOpen']); // resync the squelch every 3 s
+      case 'audio-gate':
+        _onGateMessage(msg['open']);
       case 'camera-state':
         _onCameraState(msg);
       case 'noise':
@@ -1630,6 +1781,7 @@ class ParentSession {
     final state = CameraState.fromJson(msg);
     _cameraState = state;
     if (!_cameraStates.isClosed) _cameraStates.add(state);
+    if (msg['gateOpen'] is bool) _onGateMessage(msg['gateOpen']);
   }
 
   /// Sends a camera-control change to the camera (F13/F15). The camera is the
@@ -1810,6 +1962,7 @@ class ParentSession {
     await _securityAlerts.close();
     await _cameraStates.close();
     await _audioLevels.close();
+    await _playback.close();
   }
 
   Future<void> _disposePc() async {

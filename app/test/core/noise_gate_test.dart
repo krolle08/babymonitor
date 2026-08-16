@@ -198,6 +198,110 @@ void main() {
     });
   });
 
+  // F13 — the squelch: what the parent's speaker actually plays.
+  group('NoiseGate squelch', () {
+    NoiseGate build({Duration hang = const Duration(seconds: 15)}) => NoiseGate(
+          threshold: 0.30,
+          cooldown: cooldown,
+          sustain: const Duration(seconds: 2),
+          hang: hang,
+        );
+
+    test('starts closed — a quiet room is not played', () {
+      final gate = build();
+      expect(gate.open, isFalse);
+      gate.feed(0.05, t0);
+      expect(gate.open, isFalse);
+    });
+
+    test('a snore never opens it', () {
+      final gate = build();
+      gate.feed(0.80, t0); // 1 s of snore
+      expect(gate.open, isFalse);
+      gate.feed(0.05, t0.add(const Duration(seconds: 1)));
+      expect(gate.open, isFalse);
+    });
+
+    test('opens with the alert and stays open through the cooldown', () {
+      final gate = build();
+      gate.feed(0.80, t0);
+      gate.feed(0.80, t0.add(const Duration(seconds: 1)));
+      expect(gate.feed(0.80, t0.add(const Duration(seconds: 2))), isTrue);
+      expect(gate.open, isTrue);
+      // The alert is on cooldown, but the audio must not cut out.
+      expect(gate.feed(0.80, t0.add(const Duration(seconds: 5))), isFalse);
+      expect(gate.open, isTrue);
+    });
+
+    test('holds for the hang time after the room goes quiet, then closes', () {
+      final gate = build(hang: const Duration(seconds: 15));
+      gate.feed(0.80, t0);
+      gate.feed(0.80, t0.add(const Duration(seconds: 1)));
+      gate.feed(0.80, t0.add(const Duration(seconds: 2)));
+      expect(gate.open, isTrue);
+
+      gate.feed(0.02, t0.add(const Duration(seconds: 3))); // baby settles
+      expect(gate.open, isTrue, reason: 'still inside the hang window');
+      gate.feed(0.02, t0.add(const Duration(seconds: 17)));
+      expect(gate.open, isTrue, reason: '14 s quiet — one second to go');
+      gate.feed(0.02, t0.add(const Duration(seconds: 18)));
+      expect(gate.open, isFalse);
+    });
+
+    test('a sob inside the hang window restarts the hold', () {
+      final gate = build(hang: const Duration(seconds: 10));
+      gate.feed(0.80, t0);
+      gate.feed(0.80, t0.add(const Duration(seconds: 1)));
+      gate.feed(0.80, t0.add(const Duration(seconds: 2)));
+      gate.feed(0.02, t0.add(const Duration(seconds: 5))); // quiet 3 s
+      // Loud again — the quiet run is forgotten…
+      gate.feed(0.80, t0.add(const Duration(seconds: 8)));
+      gate.feed(0.02, t0.add(const Duration(seconds: 9)));
+      // …so 10 s after the *first* silence it is still open.
+      gate.feed(0.02, t0.add(const Duration(seconds: 16)));
+      expect(gate.open, isTrue);
+      gate.feed(0.02, t0.add(const Duration(seconds: 20)));
+      expect(gate.open, isFalse);
+    });
+
+    test('zero hang closes as soon as the room is quiet', () {
+      final gate = build(hang: Duration.zero);
+      gate.feed(0.80, t0);
+      gate.feed(0.80, t0.add(const Duration(seconds: 1)));
+      gate.feed(0.80, t0.add(const Duration(seconds: 2)));
+      expect(gate.open, isTrue);
+      gate.feed(0.02, t0.add(const Duration(seconds: 3)));
+      expect(gate.open, isFalse);
+    });
+
+    test('steady background never opens it', () {
+      final gate = NoiseGate(
+        threshold: 0.30,
+        cooldown: cooldown,
+        ignoreSteady: true,
+        floorAlpha: 0.5,
+      );
+      var now = t0;
+      for (var i = 0; i < 20; i++) {
+        gate.feed(0.28, now); // breathing, all night
+        now = now.add(const Duration(seconds: 1));
+      }
+      expect(gate.open, isFalse);
+      expect(gate.feed(0.31, now), isFalse); // still inside the margin
+      expect(gate.open, isFalse);
+    });
+
+    test('reset closes it again', () {
+      final gate = build();
+      gate.feed(0.80, t0);
+      gate.feed(0.80, t0.add(const Duration(seconds: 1)));
+      gate.feed(0.80, t0.add(const Duration(seconds: 2)));
+      expect(gate.open, isTrue);
+      gate.reset();
+      expect(gate.open, isFalse);
+    });
+  });
+
   group('NoiseGate.fromFilter', () {
     test('takes every knob from the filter', () {
       final gate = NoiseGate.fromFilter(
@@ -205,12 +309,14 @@ void main() {
           threshold: 0.42,
           sustain: Duration(seconds: 5),
           ignoreSteady: false,
+          hang: Duration(seconds: 25),
         ),
         cooldown: cooldown,
       );
       expect(gate.threshold, 0.42);
       expect(gate.sustain, const Duration(seconds: 5));
       expect(gate.ignoreSteady, isFalse);
+      expect(gate.hang, const Duration(seconds: 25));
     });
 
     test('applyFilter changes the bar live, keeping the cooldown', () {
@@ -220,10 +326,12 @@ void main() {
         threshold: 0.95,
         sustain: Duration(seconds: 4),
         ignoreSteady: true,
+        hang: Duration(seconds: 5),
       ));
       expect(gate.threshold, 0.95);
       expect(gate.sustain, const Duration(seconds: 4));
       expect(gate.ignoreSteady, isTrue);
+      expect(gate.hang, const Duration(seconds: 5));
       // The cooldown from the earlier fire is still running.
       expect(gate.lastFiredAt, t0);
     });

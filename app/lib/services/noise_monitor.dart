@@ -42,13 +42,22 @@ class NoiseMonitor {
   final Duration sampleInterval;
 
   final StreamController<double> _levels = StreamController<double>.broadcast();
+  final StreamController<bool> _gateStates = StreamController<bool>.broadcast();
 
   Timer? _timer;
   bool _sampling = false;
   double _lastLevel = 0.0;
+  bool _lastGateOpen = false;
 
   /// Every sampled level (0.0–1.0), for the live meter on both units.
   Stream<double> get levels => _levels.stream;
+
+  /// Squelch transitions (F13): true when the room is worth listening to.
+  /// Emitted only on change — the camera relays each one to its parents.
+  Stream<bool> get gateStates => _gateStates.stream;
+
+  /// Whether the squelch is open right now.
+  bool get gateOpen => gate.open;
 
   /// Most recent sampled level (0.0–1.0); also stamped into heartbeats.
   double get lastLevel => _lastLevel;
@@ -74,9 +83,12 @@ class NoiseMonitor {
       final level = await _sampleLevel();
       _lastLevel = level.isFinite ? level.clamp(0.0, 1.0).toDouble() : 0.0;
       if (!_levels.isClosed) _levels.add(_lastLevel);
-      if (gate.feed(_lastLevel, _now())) {
-        onNoise?.call(_lastLevel);
+      final fired = gate.feed(_lastLevel, _now());
+      if (gate.open != _lastGateOpen) {
+        _lastGateOpen = gate.open;
+        if (!_gateStates.isClosed) _gateStates.add(_lastGateOpen);
       }
+      if (fired) onNoise?.call(_lastLevel);
     } catch (e) {
       debugPrint('NoiseMonitor: sample failed: $e');
     } finally {
@@ -90,15 +102,18 @@ class NoiseMonitor {
     _timer = null;
   }
 
-  /// Fresh session: clears the cooldown, the learned floor and the last level.
+  /// Fresh session: clears the cooldown, the squelch, the learned floor and
+  /// the last level.
   void reset() {
     gate.reset();
     _lastLevel = 0.0;
+    _lastGateOpen = false;
   }
 
   /// [stop] plus stream teardown. The monitor is unusable afterwards.
   Future<void> dispose() async {
     stop();
     await _levels.close();
+    await _gateStates.close();
   }
 }
