@@ -1,4 +1,5 @@
-/// Parent-unit screen (spec F1/F3–F7, F11/F12, docs/PROTOCOL.md §5.4, §7, §8).
+/// Parent-unit screen (spec F1/F3–F7, F11–F15, docs/PROTOCOL.md §4, §5.4,
+/// §7, §8).
 ///
 /// Pre-join is a **camera picker**: trusted cameras (F12) that connect with zero
 /// input, marked "nearby" when mDNS finds them on this network (F11), plus a
@@ -8,6 +9,12 @@
 /// badge (§7) and noise alerts — snackbar when foregrounded, notification when
 /// backgrounded (F7 / AT-09). A camera-key mismatch raises a blocking security
 /// alert that disconnects on dismiss (§8.2).
+///
+/// While watching, the parent can also drive the camera itself: a full-screen
+/// view with fading chrome (F14) and a control sheet for brightness, night
+/// mode, the camera light and the sound filter (F13/F15) — changes travel to
+/// the camera on the `health` data channel and come back as authoritative
+/// state, so both units always agree.
 library;
 
 import 'dart:async';
@@ -17,6 +24,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../config/app_config.dart';
+import '../core/camera_controls.dart';
 import '../core/health_state.dart';
 import '../core/identity.dart';
 import '../services/discovery_service.dart';
@@ -24,10 +32,14 @@ import '../services/notification_service.dart';
 import '../services/settings_service.dart';
 import '../services/trust_service.dart';
 import '../services/webrtc_service.dart';
+import '../widgets/adjustable_video_view.dart';
+import '../widgets/camera_controls_panel.dart';
 import '../widgets/health_badge.dart';
+import '../widgets/immersive.dart';
 import '../widgets/ptt_button.dart';
 import '../widgets/reconnect_banner.dart';
 import '../widgets/security_alert_listener.dart';
+import '../widgets/sound_level_meter.dart';
 import 'history_screen.dart';
 import 'settings_screen.dart';
 import 'trusted_devices_screen.dart';
@@ -54,6 +66,9 @@ class _ParentScreenState extends State<ParentScreen>
   /// Implicit LAN room for a trusted, zero-input connect (§7).
   static const String _trustedRoomId = 'LOCAL';
 
+  /// How long the overlay stays up in full-screen before fading away (F14).
+  static const Duration _chromeTimeout = Duration(seconds: 4);
+
   late final TextEditingController _codeController;
   final RTCVideoRenderer _renderer = RTCVideoRenderer();
   final List<StreamSubscription<dynamic>> _subs = [];
@@ -72,6 +87,18 @@ class _ParentScreenState extends State<ParentScreen>
 
   Set<String> _nearby = {};
   bool _scanningNearby = false;
+
+  /// The camera's picture + sound-filter settings (F13/F15). Until the data
+  /// channel reports in, this is the neutral default.
+  CameraState _cameraState = const CameraState(
+    controls: CameraControls.defaults,
+    capabilities: CameraCapabilities.none,
+  );
+  double _level = 0.0;
+
+  bool _fullscreen = false;
+  bool _chromeVisible = true;
+  Timer? _chromeTimer;
 
   @override
   void initState() {
@@ -162,6 +189,8 @@ class _ParentScreenState extends State<ParentScreen>
     _subs.add(session.latencies.listen(_onLatency));
     _subs.add(session.noiseAlerts.listen(_onNoiseAlert));
     _subs.add(session.transport.listen(_onTransport));
+    _subs.add(session.cameraStates.listen(_onCameraState));
+    _subs.add(session.audioLevels.listen(_onAudioLevel));
     await session.join(roomId); // never throws (NTR3)
     if (!mounted) return;
     setState(() {
@@ -202,6 +231,63 @@ class _ParentScreenState extends State<ParentScreen>
     if (mounted) setState(() => _transport = transport);
   }
 
+  void _onCameraState(CameraState state) {
+    if (mounted) setState(() => _cameraState = state);
+  }
+
+  void _onAudioLevel(double level) {
+    if (mounted) setState(() => _level = level);
+  }
+
+  // --- Full screen (F14) ---
+
+  void _setFullscreen(bool value) {
+    setState(() {
+      _fullscreen = value;
+      _chromeVisible = true;
+    });
+    unawaited(setImmersive(value));
+    _restartChromeTimer();
+  }
+
+  void _restartChromeTimer() {
+    _chromeTimer?.cancel();
+    if (!_fullscreen) return;
+    _chromeTimer = Timer(_chromeTimeout, () {
+      if (mounted && _fullscreen) setState(() => _chromeVisible = false);
+    });
+  }
+
+  void _tapVideo() {
+    if (!_fullscreen) return;
+    setState(() => _chromeVisible = !_chromeVisible);
+    _restartChromeTimer();
+  }
+
+  // --- Camera controls (F13/F15) ---
+
+  /// Opens the control sheet. Changes travel to the camera on the `health`
+  /// data channel; the camera applies them and broadcasts the result back, so
+  /// every parent — and the camera unit itself — stays in sync.
+  Future<void> _openCameraControls() {
+    final session = _session;
+    _restartChromeTimer();
+    return showCameraControlsSheet(
+      context,
+      initialState: _cameraState,
+      states: session?.cameraStates,
+      levels: session?.audioLevels,
+      enabled: session?.canControlCamera ?? false,
+      disabledHint: 'Waiting for the camera link — controls will work as soon '
+          'as the stream is up.',
+      onPreview: (controls) => setState(() => _cameraState = CameraState(
+            controls: controls,
+            capabilities: _cameraState.capabilities,
+          )),
+      onChanged: (controls) => session?.sendCameraControl(controls),
+    );
+  }
+
   void _onNoiseAlert(NoiseAlert alert) {
     final percent = (alert.audioLevel.clamp(0.0, 1.0) * 100).round();
     if (_foregrounded) {
@@ -224,6 +310,9 @@ class _ParentScreenState extends State<ParentScreen>
       await sub.cancel();
     }
     _subs.clear();
+    _chromeTimer?.cancel();
+    _chromeTimer = null;
+    if (_fullscreen) unawaited(setImmersive(false));
     if (_rendererReady) _renderer.srcObject = null;
     if (mounted) {
       setState(() {
@@ -234,6 +323,13 @@ class _ParentScreenState extends State<ParentScreen>
         _retrySeconds = null;
         _latencyMs = null;
         _transport = 'none';
+        _fullscreen = false;
+        _chromeVisible = true;
+        _level = 0.0;
+        _cameraState = const CameraState(
+          controls: CameraControls.defaults,
+          capabilities: CameraCapabilities.none,
+        );
       });
       unawaited(_refreshNearby());
     }
@@ -243,6 +339,9 @@ class _ParentScreenState extends State<ParentScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _chromeTimer?.cancel();
+    _chromeTimer = null;
+    if (_fullscreen) unawaited(setImmersive(false));
     for (final sub in _subs) {
       unawaited(sub.cancel());
     }
@@ -462,108 +561,200 @@ class _ParentScreenState extends State<ParentScreen>
     final theme = Theme.of(context);
     final session = _session;
     final alerts = session?.securityAlerts ?? const Stream<String>.empty();
+    // In full screen the overlay fades out so nothing sits on the crib view
+    // (F14); tapping the picture brings it back.
+    final showChrome = !_fullscreen || _chromeVisible;
     return SecurityAlertListener(
       alerts: alerts,
       onDismiss: () => unawaited(_leave()),
       child: Scaffold(
         backgroundColor: Colors.black,
-        appBar: AppBar(
-          title: Text(_roomLabel),
-          actions: [
-            IconButton(
-              icon: const Icon(Icons.history),
-              tooltip: 'History',
-              onPressed: _openHistory,
-            ),
-            IconButton(
-              icon: const Icon(Icons.settings_outlined),
-              tooltip: 'Settings',
-              onPressed: _openSettings,
-            ),
-            IconButton(
-              icon: const Icon(Icons.logout),
-              tooltip: 'Leave',
-              onPressed: () => unawaited(_leave()),
-            ),
-          ],
-        ),
-        body: Stack(
-          fit: StackFit.expand,
-          children: [
-            if (_hasVideo)
-              RTCVideoView(
-                _renderer,
-                mirror: false,
-                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-              )
-            else
-              Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const CircularProgressIndicator(),
-                    const SizedBox(height: 12),
-                    Text(
-                      'Connecting to camera…',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
+        appBar: _fullscreen
+            ? null
+            : AppBar(
+                title: Text(_roomLabel),
+                actions: [
+                  IconButton(
+                    icon: const Icon(Icons.tune),
+                    tooltip: 'Camera controls',
+                    onPressed: () => unawaited(_openCameraControls()),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.fullscreen),
+                    tooltip: 'Full screen',
+                    onPressed: () => _setFullscreen(true),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.history),
+                    tooltip: 'History',
+                    onPressed: _openHistory,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.settings_outlined),
+                    tooltip: 'Settings',
+                    onPressed: _openSettings,
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.logout),
+                    tooltip: 'Leave',
+                    onPressed: () => unawaited(_leave()),
+                  ),
+                ],
               ),
-            SafeArea(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Row(
-                      children: [
-                        HealthBadge(state: _health),
-                        const SizedBox(width: 8),
-                        if (_transport == 'lan' || _transport == 'cloud')
-                          _TransportBadge(transport: _transport),
-                        const Spacer(),
-                        if (_latencyMs != null) _LatencyChip(ms: _latencyMs!),
-                      ],
-                    ),
-                    if (_health == HealthState.reconnecting)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 12),
-                        child: Center(
-                          child: ReconnectBanner(
-                            secondsRemaining: _retrySeconds,
-                            onRetryNow: () =>
-                                unawaited(_session?.manualReconnect()),
-                          ),
+        body: GestureDetector(
+          onTap: _tapVideo,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (_hasVideo)
+                AdjustableVideoView(
+                  renderer: _renderer,
+                  brightness: _cameraState.controls.brightness,
+                  nightMode: _cameraState.controls.nightMode,
+                  // Full screen shows the whole frame — cropping the crib out
+                  // of the picture is exactly what you don't want at 3 a.m.
+                  objectFit: _fullscreen
+                      ? RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
+                      : RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                )
+              else
+                Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const CircularProgressIndicator(),
+                      const SizedBox(height: 12),
+                      Text(
+                        'Connecting to camera…',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ),
-            if (_health == HealthState.frozen) const _FrozenOverlay(),
-            if (_health == HealthState.failed)
-              _FailedOverlay(
-                onReconnect: () => unawaited(_session?.manualReconnect()),
-              ),
-            if (_health != HealthState.failed)
-              Align(
-                alignment: Alignment.bottomCenter,
-                child: SafeArea(
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 20),
-                    child: PttButton(
-                      onTalkingChanged: (on) =>
-                          unawaited(_session?.setTalking(on)),
+              AnimatedOpacity(
+                opacity: showChrome ? 1 : 0,
+                duration: const Duration(milliseconds: 200),
+                child: IgnorePointer(
+                  ignoring: !showChrome,
+                  child: SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Row(
+                            children: [
+                              HealthBadge(state: _health),
+                              const SizedBox(width: 8),
+                              if (_transport == 'lan' || _transport == 'cloud')
+                                _TransportBadge(transport: _transport),
+                              const Spacer(),
+                              if (_latencyMs != null)
+                                _LatencyChip(ms: _latencyMs!),
+                            ],
+                          ),
+                          // Room level vs the alert bar (F13) — the same view
+                          // the camera unit has, so the filter can be tuned
+                          // from bed.
+                          Padding(
+                            padding: const EdgeInsets.only(top: 10),
+                            child: SizedBox(
+                              width: 168,
+                              child: SoundLevelMeter(
+                                level: _level,
+                                threshold: _cameraState.controls.sound.threshold,
+                                height: 8,
+                              ),
+                            ),
+                          ),
+                          if (_fullscreen)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 12),
+                              child: Row(
+                                children: [
+                                  _OverlayButton(
+                                    icon: Icons.tune,
+                                    tooltip: 'Camera controls',
+                                    onPressed: () =>
+                                        unawaited(_openCameraControls()),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _OverlayButton(
+                                    icon: Icons.fullscreen_exit,
+                                    tooltip: 'Exit full screen',
+                                    onPressed: () => _setFullscreen(false),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          if (_health == HealthState.reconnecting)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 12),
+                              child: Center(
+                                child: ReconnectBanner(
+                                  secondsRemaining: _retrySeconds,
+                                  onRetryNow: () =>
+                                      unawaited(_session?.manualReconnect()),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
               ),
-          ],
+              if (_health == HealthState.frozen) const _FrozenOverlay(),
+              if (_health == HealthState.failed)
+                _FailedOverlay(
+                  onReconnect: () => unawaited(_session?.manualReconnect()),
+                ),
+              if (_health != HealthState.failed && showChrome)
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 20),
+                      child: PttButton(
+                        onTalkingChanged: (on) =>
+                            unawaited(_session?.setTalking(on)),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
         ),
+      ),
+    );
+  }
+}
+
+/// Round translucent icon button for the full-screen video overlay (F14).
+class _OverlayButton extends StatelessWidget {
+  const _OverlayButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xCC0A101F),
+      shape: const CircleBorder(side: BorderSide(color: Color(0x33FFFFFF))),
+      clipBehavior: Clip.antiAlias,
+      child: IconButton(
+        icon: Icon(icon, color: const Color(0xFFC6D0E2)),
+        tooltip: tooltip,
+        onPressed: onPressed,
       ),
     );
   }

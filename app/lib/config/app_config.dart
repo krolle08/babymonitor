@@ -23,6 +23,36 @@ class AppConfig {
   };
   static const String defaultNoiseSensitivity = 'medium';
 
+  // --- Sound filter (F13: ignore snoring, breathing, the fan) ---
+  /// The bar a sound must clear, when no preset/custom value is stored.
+  static const double defaultNoiseThreshold = 0.30; // == 'medium'
+  static const double minNoiseThreshold = 0.05;
+  static const double maxNoiseThreshold = 0.95;
+
+  /// How long a sound must hold above the bar before it alerts. A snore burst
+  /// is 1–2 s; 2 s still leaves headroom inside the F7 "alert within 5 s" AC.
+  static const Duration defaultNoiseSustain = Duration(seconds: 2);
+  static const Duration maxNoiseSustain = Duration(seconds: 15);
+
+  /// Reject sound that only just clears the room's learned quiet floor.
+  static const bool defaultIgnoreSteadySound = true;
+
+  /// How far above the learned quiet floor a sound must be to count.
+  static const double steadySoundMargin = 0.08;
+
+  /// EMA weight the quiet floor follows sub-threshold samples with (~20 s to
+  /// settle at the 1 s sampling interval).
+  static const double quietFloorAlpha = 0.05;
+
+  // --- Camera image controls (F15) ---
+  /// Capture frame rate: normal, and in night mode (lower = longer exposure
+  /// per frame, so a dim room is visibly brighter).
+  static const int captureFrameRate = 15;
+  static const int nightCaptureFrameRate = 8;
+
+  /// Extra picture gain night mode starts from, -1.0 … 1.0.
+  static const double nightModeBrightness = 0.35;
+
   // --- Latency (F1) ---
   static const int latencyAlertMs = 5000;
 

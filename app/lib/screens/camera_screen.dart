@@ -1,9 +1,11 @@
-/// Camera-unit screen (spec F1/F2/F7/F8/F9, docs/PROTOCOL.md §5.4).
+/// Camera-unit screen (spec F1/F2/F7/F8/F9/F13/F14/F15, docs/PROTOCOL.md §5.4).
 ///
 /// Starts a [CameraSession] on entry (wakelock keeps the screen on — F2),
 /// shows the giant 6-char room code parents type (NTR2: pairing under 60 s),
-/// a local preview, the joined-parents count (F8), the wakelock warning
-/// banner (F2 AC) and a noise-sensitivity quick toggle (F7). Stop closes the
+/// a local preview rendered with the session's picture settings (F15), the
+/// joined-parents count (F8), the wakelock warning banner (F2 AC) and a live
+/// sound-filter meter (F13). A full-screen preview (F14) makes it easy to
+/// check the framing from across the room before leaving. Stop closes the
 /// sleep-log session (F9) and returns to the role picker.
 library;
 
@@ -12,10 +14,15 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import '../core/camera_controls.dart';
 import '../services/settings_service.dart';
 import '../services/sleep_log_service.dart';
 import '../services/webrtc_service.dart';
+import '../widgets/adjustable_video_view.dart';
+import '../widgets/camera_controls_panel.dart';
+import '../widgets/immersive.dart';
 import '../widgets/pairing_qr_overlay.dart';
+import '../widgets/sound_level_meter.dart';
 import 'trusted_devices_screen.dart';
 
 enum _Phase { starting, running, error }
@@ -31,6 +38,9 @@ class CameraScreen extends StatefulWidget {
 }
 
 class _CameraScreenState extends State<CameraScreen> {
+  /// How long the overlay stays up in full-screen before fading away.
+  static const Duration _chromeTimeout = Duration(seconds: 4);
+
   final SleepLogService _log = SleepLogService();
   final RTCVideoRenderer _renderer = RTCVideoRenderer();
   final List<StreamSubscription<dynamic>> _subs = [];
@@ -45,9 +55,19 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _rendererReady = false;
   bool _stopping = false;
   bool _tornDown = false;
-  String _sensitivity = SettingsService.instance.noiseSensitivity;
   bool _allowCodeJoins = SettingsService.instance.allowCodeJoins;
 
+  /// Picture + sound-filter settings (F13/F15), seeded from what was saved so
+  /// the preview is correct before the session reports in.
+  CameraState _cameraState = CameraState(
+    controls: SettingsService.instance.cameraControls,
+    capabilities: CameraCapabilities.none,
+  );
+  double _level = 0.0;
+
+  bool _fullscreen = false;
+  bool _chromeVisible = true;
+  Timer? _chromeTimer;
   Timer? _roomPoll;
 
   @override
@@ -75,6 +95,12 @@ class _CameraScreenState extends State<CameraScreen> {
     _subs.add(_session.parentTalk.listen((event) {
       if (mounted) setState(() => _parentTalking = event.on);
     }));
+    _subs.add(_session.cameraStates.listen((state) {
+      if (mounted) setState(() => _cameraState = state);
+    }));
+    _subs.add(_session.audioLevels.listen((level) {
+      if (mounted) setState(() => _level = level);
+    }));
   }
 
   Future<void> _cancelSubs() async {
@@ -93,7 +119,12 @@ class _CameraScreenState extends State<CameraScreen> {
       }
       await _session.start();
       _renderer.srcObject = _session.localStream;
-      if (mounted) setState(() => _phase = _Phase.running);
+      if (mounted) {
+        setState(() {
+          _phase = _Phase.running;
+          _cameraState = _session.cameraState;
+        });
+      }
     } catch (e) {
       debugPrint('CameraScreen: session start failed: $e');
       if (mounted) setState(() => _phase = _Phase.error);
@@ -123,6 +154,9 @@ class _CameraScreenState extends State<CameraScreen> {
     _tornDown = true;
     _roomPoll?.cancel();
     _roomPoll = null;
+    _chromeTimer?.cancel();
+    _chromeTimer = null;
+    if (_fullscreen) unawaited(setImmersive(false));
     await _cancelSubs();
     await _session.dispose(); // logs session end + releases wakelock (F2, F9)
     await _log.dispose();
@@ -141,9 +175,65 @@ class _CameraScreenState extends State<CameraScreen> {
       unawaited(_session.dispose());
       unawaited(_log.dispose());
     }
+    _chromeTimer?.cancel();
+    _chromeTimer = null;
+    if (_fullscreen) unawaited(setImmersive(false));
     _renderer.srcObject = null;
     unawaited(_renderer.dispose());
     super.dispose();
+  }
+
+  // --- Full-screen preview (F14) ---
+
+  void _setFullscreen(bool value) {
+    setState(() {
+      _fullscreen = value;
+      _chromeVisible = true;
+    });
+    unawaited(setImmersive(value));
+    _restartChromeTimer();
+  }
+
+  void _restartChromeTimer() {
+    _chromeTimer?.cancel();
+    if (!_fullscreen) return;
+    _chromeTimer = Timer(_chromeTimeout, () {
+      if (mounted && _fullscreen) setState(() => _chromeVisible = false);
+    });
+  }
+
+  void _tapPreview() {
+    if (!_fullscreen) return;
+    setState(() => _chromeVisible = !_chromeVisible);
+    _restartChromeTimer();
+  }
+
+  // --- Controls (F13/F15) ---
+
+  /// The camera reads its own level off the outbound stream (`getStats()`
+  /// media-source), so there is nothing to sample until someone is watching.
+  /// Say so rather than showing a meter stuck at zero.
+  String? get _meterNote => _parentCount > 0
+      ? null
+      : 'The meter runs while a parent is watching — connect one to set the '
+          'bar against the real room.';
+
+  Future<void> _openControls() {
+    _restartChromeTimer();
+    return showCameraControlsSheet(
+      context,
+      initialState: _cameraState,
+      states: _session.cameraStates,
+      levels: _session.audioLevels,
+      enabled: _phase == _Phase.running,
+      disabledHint: 'The camera is not running yet.',
+      meterNote: _meterNote,
+      onPreview: (controls) => setState(() => _cameraState = CameraState(
+            controls: controls,
+            capabilities: _cameraState.capabilities,
+          )),
+      onChanged: (controls) => unawaited(_session.applyControls(controls)),
+    );
   }
 
   void _openTrustedDevices() {
@@ -163,10 +253,20 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_fullscreen && _phase == _Phase.running) {
+      return _buildFullscreen(context);
+    }
     return Scaffold(
       appBar: AppBar(
         title: const Text('Camera unit'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.tune),
+            tooltip: 'Camera controls',
+            onPressed: _phase == _Phase.running
+                ? () => unawaited(_openControls())
+                : null,
+          ),
           IconButton(
             icon: const Icon(Icons.devices_outlined),
             tooltip: 'Trusted devices',
@@ -229,8 +329,79 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
+  Widget _buildPreview() => AdjustableVideoView(
+        renderer: _renderer,
+        brightness: _cameraState.controls.brightness,
+        nightMode: _cameraState.controls.nightMode,
+        objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+      );
+
+  /// Full-screen framing check (F14): the whole screen is the crib view, with
+  /// an overlay that fades out so nothing competes with the picture.
+  Widget _buildFullscreen(BuildContext context) {
+    final code = _roomId;
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        onTap: _tapPreview,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            _buildPreview(),
+            AnimatedOpacity(
+              opacity: _chromeVisible ? 1 : 0,
+              duration: const Duration(milliseconds: 200),
+              child: IgnorePointer(
+                ignoring: !_chromeVisible,
+                child: SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      children: [
+                        Row(
+                          children: [
+                            _OverlayChip(
+                              icon: Icons.visibility_outlined,
+                              label: _parentCount == 1
+                                  ? '1 parent'
+                                  : '$_parentCount parents',
+                            ),
+                            if (code != null) ...[
+                              const SizedBox(width: 8),
+                              _OverlayChip(icon: Icons.key_outlined, label: code),
+                            ],
+                            const Spacer(),
+                            _OverlayButton(
+                              icon: Icons.tune,
+                              tooltip: 'Camera controls',
+                              onPressed: () => unawaited(_openControls()),
+                            ),
+                            const SizedBox(width: 8),
+                            _OverlayButton(
+                              icon: Icons.fullscreen_exit,
+                              tooltip: 'Exit full screen',
+                              onPressed: () => _setFullscreen(false),
+                            ),
+                          ],
+                        ),
+                        const Spacer(),
+                        SoundLevelMeter(
+                          level: _level,
+                          threshold: _cameraState.controls.sound.threshold,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildRunning(BuildContext context) {
-    final theme = Theme.of(context);
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -250,10 +421,20 @@ class _CameraScreenState extends State<CameraScreen> {
               borderRadius: BorderRadius.circular(16),
               child: ColoredBox(
                 color: Colors.black,
-                child: RTCVideoView(
-                  _renderer,
-                  mirror: false,
-                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    _buildPreview(),
+                    Positioned(
+                      right: 8,
+                      bottom: 8,
+                      child: _OverlayButton(
+                        icon: Icons.fullscreen,
+                        tooltip: 'Full screen',
+                        onPressed: () => _setFullscreen(true),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -274,32 +455,24 @@ class _CameraScreenState extends State<CameraScreen> {
                   label: 'Parent talking',
                   color: Color(0xFF10B981),
                 ),
+              if (_cameraState.controls.nightMode) ...[
+                const SizedBox(width: 8),
+                const _InfoChip(
+                  icon: Icons.nightlight_round,
+                  label: 'Night mode',
+                  color: Color(0xFF93C5FD),
+                ),
+              ],
             ],
           ),
           const SizedBox(height: 12),
-          Text(
-            'NOISE ALERT SENSITIVITY',
-            style: theme.textTheme.labelSmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-              letterSpacing: 1.5,
-            ),
+          _SoundFilterCard(
+            level: _level,
+            filter: _cameraState.controls.sound,
+            note: _meterNote,
+            onAdjust: () => unawaited(_openControls()),
           ),
-          const SizedBox(height: 8),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'low', label: Text('Low')),
-              ButtonSegment(value: 'medium', label: Text('Medium')),
-              ButtonSegment(value: 'high', label: Text('High')),
-            ],
-            selected: {_sensitivity},
-            showSelectedIcon: false,
-            onSelectionChanged: (selection) {
-              final value = selection.first;
-              _session.setNoiseSensitivity(value); // applies live (F7)
-              setState(() => _sensitivity = value);
-            },
-          ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 12),
           OutlinedButton.icon(
             onPressed: () => unawaited(_addTrustedDevice()),
             icon: const Icon(Icons.add_link),
@@ -325,6 +498,77 @@ class _CameraScreenState extends State<CameraScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Live meter + the current bar, with a shortcut into the full control sheet
+/// (F13). Sitting next to the crib you can watch the baby breathe and see
+/// that it stays under the bar.
+class _SoundFilterCard extends StatelessWidget {
+  const _SoundFilterCard({
+    required this.level,
+    required this.filter,
+    required this.onAdjust,
+    this.note,
+  });
+
+  final double level;
+  final SoundFilter filter;
+  final VoidCallback onAdjust;
+
+  /// Why the meter is not moving, when it is not moving.
+  final String? note;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final sustain = filter.sustain.inSeconds;
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 12, 8, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Text(
+                  'SOUND FILTER',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+                const Spacer(),
+                TextButton.icon(
+                  onPressed: onAdjust,
+                  icon: const Icon(Icons.tune, size: 18),
+                  label: const Text('Adjust'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            SoundLevelMeter(level: level, threshold: filter.threshold),
+            const SizedBox(height: 8),
+            if (note != null) ...[
+              Text(
+                note!,
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+              const SizedBox(height: 6),
+            ],
+            Text(
+              'Alerts above ${(filter.threshold * 100).round()}%'
+              '${sustain > 0 ? ', held for ${sustain}s' : ''}'
+              '${filter.ignoreSteady ? ', steady background ignored' : ''}.',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -531,6 +775,64 @@ class _InfoChip extends StatelessWidget {
           const SizedBox(width: 6),
           Text(label, style: TextStyle(color: fg, fontSize: 12)),
         ],
+      ),
+    );
+  }
+}
+
+/// Dark translucent chip legible on top of a video frame (F14 overlay).
+class _OverlayChip extends StatelessWidget {
+  const _OverlayChip({required this.icon, required this.label});
+
+  final IconData icon;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xCC0A101F),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: const Color(0x33FFFFFF)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: const Color(0xFF93A1BC)),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: const TextStyle(color: Color(0xFFC6D0E2), fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Round translucent icon button for video overlays (F14).
+class _OverlayButton extends StatelessWidget {
+  const _OverlayButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xCC0A101F),
+      shape: const CircleBorder(side: BorderSide(color: Color(0x33FFFFFF))),
+      clipBehavior: Clip.antiAlias,
+      child: IconButton(
+        icon: Icon(icon, color: const Color(0xFFC6D0E2)),
+        tooltip: tooltip,
+        onPressed: onPressed,
       ),
     );
   }

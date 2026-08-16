@@ -29,6 +29,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import '../config/app_config.dart';
 import '../core/auth_engine.dart';
 import '../core/backoff_scheduler.dart';
+import '../core/camera_controls.dart';
 import '../core/freeze_detector.dart';
 import '../core/health_monitor.dart';
 import '../core/health_state.dart';
@@ -177,9 +178,18 @@ class CameraSession {
       StreamController<TalkEvent>.broadcast();
   final StreamController<int> _parentCount = StreamController<int>.broadcast();
 
+  final StreamController<CameraState> _cameraStates =
+      StreamController<CameraState>.broadcast();
+  final StreamController<double> _audioLevels =
+      StreamController<double>.broadcast();
+
+  CameraControls _controls = CameraControls.defaults;
+  CameraCapabilities _capabilities = CameraCapabilities.none;
+
   MediaStream? _localStream;
   NoiseMonitor? _noiseMonitor;
   Timer? _hbTimer;
+  StreamSubscription<double>? _levelSub;
   StreamSubscription<Map<String, dynamic>>? _cloudMsgSub;
   StreamSubscription<bool>? _cloudConnSub;
   StreamSubscription<Map<String, dynamic>>? _lanMsgSub;
@@ -201,6 +211,22 @@ class CameraSession {
   /// Emits the number of joined parents whenever it changes (F8).
   Stream<int> get parentCount => _parentCount.stream;
 
+  /// Image + sound-filter settings, whenever they change from either unit
+  /// (F13/F15). The same value is broadcast to every parent.
+  Stream<CameraState> get cameraStates => _cameraStates.stream;
+
+  /// Live sampled audio level (0.0–1.0) for the on-camera meter (F13).
+  Stream<double> get audioLevels => _audioLevels.stream;
+
+  /// Current image + sound-filter settings.
+  CameraControls get controls => _controls;
+
+  /// What this camera's hardware supports (torch, …).
+  CameraCapabilities get capabilities => _capabilities;
+
+  CameraState get cameraState =>
+      CameraState(controls: _controls, capabilities: _capabilities);
+
   /// The 6-char cloud room code once `room-created` arrives (null on pure LAN).
   String? get roomId => _roomId;
 
@@ -221,21 +247,22 @@ class CameraSession {
     if (_started) return;
     _started = true;
 
-    // 1. Capture: back camera, 640x480@15 target — stays within the TR5
-    //    camera-device CPU budget; audio processing on for talk-back (F6).
+    // 0. Saved image + sound-filter settings (F13/F15) drive the capture
+    //    profile below, so night mode is already on at the first frame.
+    _controls = _prefs.cameraControls;
+
+    // 1. Capture: back camera, 640x480 at the profile's frame rate — stays
+    //    within the TR5 camera-device CPU budget; audio processing on for
+    //    talk-back (F6).
     _localStream = await navigator.mediaDevices.getUserMedia({
       'audio': {
         'echoCancellation': true,
         'noiseSuppression': true,
         'autoGainControl': true,
       },
-      'video': {
-        'facingMode': 'environment',
-        'width': {'ideal': 640},
-        'height': {'ideal': 480},
-        'frameRate': {'ideal': 15},
-      },
+      'video': _videoConstraints(night: _controls.nightMode),
     });
+    await _refreshCapabilities();
 
     // 2. Wakelock (F2) — failure is surfaced, not fatal.
     try {
@@ -259,16 +286,21 @@ class CameraSession {
     _hbTimer =
         Timer.periodic(AppConfig.heartbeatInterval, (_) => _sendHeartbeat());
 
-    // 5. Noise monitoring (F7) — NoiseGate inside NoiseMonitor is the single
-    //    decision point; threshold follows settings live.
+    // 5. Noise monitoring (F7/F13) — NoiseGate inside NoiseMonitor is the
+    //    single decision point; the filter follows settings live, from this
+    //    unit or from any watching parent.
     final monitor = NoiseMonitor(
       sampleLevel: _sampleAudioLevel,
-      threshold: _prefs.noiseThreshold,
+      filter: _controls.sound,
       onNoise: _onNoise,
       now: _now,
     );
     _noiseMonitor = monitor;
+    _levelSub = monitor.levels.listen((level) {
+      if (!_audioLevels.isClosed) _audioLevels.add(level);
+    });
     monitor.start();
+    _emitCameraState();
 
     // 6. In parallel, detached: cloud registration for remote viewers. Never
     //    awaited by start() — a cloud outage must not delay the golden path.
@@ -327,12 +359,154 @@ class CameraSession {
     unawaited(_signaling.connect());
   }
 
-  /// Applies a new sensitivity ('low'|'medium'|'high') live (F7 AC).
-  void setNoiseSensitivity(String sensitivity) {
-    final threshold = AppConfig.noiseThresholds[sensitivity];
-    if (threshold == null) return;
-    unawaited(_prefs.setNoiseSensitivity(sensitivity));
-    _noiseMonitor?.threshold = threshold;
+  // --- Camera image + sound controls (F13/F15) ---
+
+  Map<String, dynamic> _videoConstraints({required bool night}) => {
+        'facingMode': 'environment',
+        'width': {'ideal': 640},
+        'height': {'ideal': 480},
+        // A lower frame rate lets the sensor expose each frame for longer,
+        // which is what actually makes a dark nursery visible (F15).
+        'frameRate': {
+          'ideal': night
+              ? AppConfig.nightCaptureFrameRate
+              : AppConfig.captureFrameRate,
+        },
+      };
+
+  MediaStreamTrack? get _videoTrack {
+    final tracks = _localStream?.getVideoTracks();
+    if (tracks == null || tracks.isEmpty) return null;
+    return tracks.first;
+  }
+
+  /// Re-reads what the current capture track supports (torch). Failures leave
+  /// the capability off — the UI then greys the switch out instead of lying.
+  Future<void> _refreshCapabilities() async {
+    var torch = false;
+    try {
+      final track = _videoTrack;
+      if (track != null) torch = await track.hasTorch();
+    } catch (e) {
+      debugPrint('CameraSession: hasTorch() failed: $e');
+    }
+    _capabilities = CameraCapabilities(torch: torch);
+  }
+
+  /// Applies image + sound settings live, from this unit or from a parent
+  /// (F13/F15), persists them and tells every parent the new state. Never
+  /// throws: a control that the hardware refuses is logged and reverted in the
+  /// broadcast state, the stream is untouched (NTR3).
+  Future<void> applyControls(CameraControls next) async {
+    final previous = _controls;
+    _controls = next;
+
+    if (next.sound != previous.sound) {
+      _noiseMonitor?.applyFilter(next.sound);
+    }
+    if (next.nightMode != previous.nightMode) {
+      await _recaptureVideo();
+    }
+    if (next.light != previous.light ||
+        (next.nightMode != previous.nightMode && next.light)) {
+      await _applyTorch(next.light);
+    }
+
+    unawaited(_prefs.setCameraControls(_controls));
+    _emitCameraState();
+  }
+
+  /// Applies a partial `camera-control` patch (§4) — used by the data-channel
+  /// handler and by the UI sheets.
+  Future<void> applyControlPatch(Map<String, dynamic> patch) =>
+      applyControls(_controls.patch(patch));
+
+  Future<void> _applyTorch(bool on) async {
+    final track = _videoTrack;
+    if (track == null) return;
+    if (on && !_capabilities.torch) {
+      _controls = _controls.copyWith(light: false);
+      return;
+    }
+    try {
+      await track.setTorch(on);
+    } catch (e) {
+      debugPrint('CameraSession: setTorch($on) failed: $e');
+      _controls = _controls.copyWith(light: false);
+      _capabilities = const CameraCapabilities(torch: false);
+    }
+  }
+
+  /// Swaps the capture track for one with the current night-mode profile and
+  /// hands it to every parent's sender. The old track is stopped first: most
+  /// phones will not open a second capture session on the same camera.
+  Future<void> _recaptureVideo() async {
+    final stream = _localStream;
+    if (stream == null) return;
+    final night = _controls.nightMode;
+    final old = stream.getVideoTracks();
+    for (final track in old) {
+      try {
+        await track.stop();
+        await stream.removeTrack(track);
+      } catch (e) {
+        debugPrint('CameraSession: releasing old capture track failed: $e');
+      }
+    }
+    MediaStreamTrack? fresh;
+    try {
+      fresh = await _captureVideoTrack(night: night);
+    } catch (e) {
+      debugPrint('CameraSession: night-mode recapture failed: $e');
+    }
+    if (fresh == null && night) {
+      // Fall back to the normal profile rather than leave the crib dark.
+      _controls = _controls.copyWith(nightMode: false);
+      try {
+        fresh = await _captureVideoTrack(night: false);
+      } catch (e) {
+        debugPrint('CameraSession: fallback recapture failed: $e');
+      }
+    }
+    if (fresh == null) {
+      _warn('The camera could not be restarted after changing night mode. '
+          'Stop and start monitoring to get the picture back.');
+      return;
+    }
+    final track = fresh;
+    await stream.addTrack(track);
+    for (final peer in _peers.values) {
+      final pc = peer.pc;
+      if (pc == null) continue;
+      try {
+        for (final sender in await pc.getSenders()) {
+          if (sender.track?.kind == 'video') await sender.replaceTrack(track);
+        }
+      } catch (e) {
+        debugPrint('CameraSession: replaceTrack(${peer.peerId}) failed: $e');
+      }
+    }
+    await _refreshCapabilities(); // torch belongs to the new track
+  }
+
+  Future<MediaStreamTrack?> _captureVideoTrack({required bool night}) async {
+    final captured = await navigator.mediaDevices.getUserMedia({
+      'audio': false,
+      'video': _videoConstraints(night: night),
+    });
+    final tracks = captured.getVideoTracks();
+    return tracks.isEmpty ? null : tracks.first;
+  }
+
+  /// Publishes the current state locally (camera UI) and to every parent that
+  /// has an open `health` channel (§4).
+  void _emitCameraState() {
+    final state = cameraState;
+    if (!_cameraStates.isClosed) _cameraStates.add(state);
+    final message = {'t': 'camera-state', ...state.toJson()};
+    for (final peer in _peers.values) {
+      _channelSend(peer.channel, message);
+    }
   }
 
   // --- Pairing (§8.1) ---
@@ -592,6 +766,13 @@ class CameraSession {
           'health', RTCDataChannelInit()..ordered = true);
       peer.channel = channel;
       channel.onMessage = (message) => _onChannelMessage(peerId, message);
+      // Tell the parent what the camera is set to as soon as it can hear us
+      // (F15) — it renders with the same brightness/night curve.
+      channel.onDataChannelState = (state) {
+        if (state == RTCDataChannelState.RTCDataChannelOpen) {
+          _channelSend(channel, {'t': 'camera-state', ...cameraState.toJson()});
+        }
+      };
 
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -664,10 +845,23 @@ class CameraSession {
   void _onChannelMessage(String peerId, RTCDataChannelMessage message) {
     final msg = _decodeChannelMessage(message);
     if (msg == null) return;
-    if (msg['t'] == 'talk' && msg['on'] is bool) {
-      if (!_talk.isClosed) {
-        _talk.add(TalkEvent(peerId: peerId, on: msg['on'] as bool));
-      }
+    switch (msg['t']) {
+      case 'talk':
+        if (msg['on'] is bool && !_talk.isClosed) {
+          _talk.add(TalkEvent(peerId: peerId, on: msg['on'] as bool));
+        }
+      case 'camera-control':
+        // A parent turned a knob (F13/F15). Applying it re-broadcasts the
+        // state to every parent, so all units stay in sync.
+        final patch = msg['controls'];
+        if (patch is Map<String, dynamic>) {
+          unawaited(applyControlPatch(patch));
+        }
+      case 'get-camera-state':
+        _channelSend(
+            _peers[peerId]?.channel, {'t': 'camera-state', ...cameraState.toJson()});
+      default:
+        break; // unknown types ignored (§4, forward compatibility)
     }
   }
 
@@ -780,8 +974,17 @@ class CameraSession {
 
     _hbTimer?.cancel();
     _hbTimer = null;
-    _noiseMonitor?.stop();
+    await _levelSub?.cancel();
+    _levelSub = null;
+    final monitor = _noiseMonitor;
     _noiseMonitor = null;
+    await monitor?.dispose();
+
+    // Never leave the torch burning over a stopped session (F15).
+    if (_controls.light) {
+      _controls = _controls.copyWith(light: false);
+      await _applyTorch(false);
+    }
 
     _log?.logSessionEnd();
 
@@ -844,6 +1047,8 @@ class CameraSession {
     await _warnings.close();
     await _talk.close();
     await _parentCount.close();
+    await _cameraStates.close();
+    await _audioLevels.close();
   }
 
   void _warn(String message) {
@@ -931,7 +1136,13 @@ class ParentSession {
   final StreamController<int> _latencies = StreamController<int>.broadcast();
   final StreamController<String> _securityAlerts =
       StreamController<String>.broadcast();
+  final StreamController<CameraState> _cameraStates =
+      StreamController<CameraState>.broadcast();
+  final StreamController<double> _audioLevels =
+      StreamController<double>.broadcast();
   final Set<int> _seenNoiseTs = <int>{};
+
+  CameraState? _cameraState;
 
   RTCPeerConnection? _pc;
   RTCDataChannel? _channel;
@@ -981,6 +1192,22 @@ class ParentSession {
   /// Fired when the camera's key no longer matches the trusted one (§8.2) —
   /// the UI must show a hard "re-pair" alert (possible MITM / reinstall).
   Stream<String> get securityAlerts => _securityAlerts.stream;
+
+  /// The camera's image + sound-filter settings and hardware capabilities
+  /// (F13/F15) — pushed when the channel opens and on every change.
+  Stream<CameraState> get cameraStates => _cameraStates.stream;
+
+  /// Last known camera state, or null before the channel reported one.
+  CameraState? get cameraState => _cameraState;
+
+  /// The camera's audio level (0.0–1.0) as it arrives on the heartbeat, for
+  /// the live meter under the sound-filter bar (F13).
+  Stream<double> get audioLevels => _audioLevels.stream;
+
+  /// Whether camera controls can be changed right now: they travel P2P on the
+  /// `health` channel (§4), so they need an open channel, not just a picture.
+  bool get canControlCamera =>
+      _channel?.state == RTCDataChannelState.RTCDataChannelOpen;
 
   /// Stream latency measured at connect: heartbeat `ts` vs local clock,
   /// clamped >= 0 (F1 — alert when it exceeds [AppConfig.latencyAlertMs]).
@@ -1132,6 +1359,7 @@ class ParentSession {
           final seq = msg['seq'];
           final ts = msg['ts'];
           if (seq is num && ts is num) _onHeartbeat(seq.toInt(), ts.toInt());
+          _onAudioLevel(msg['audioLevel']);
         case 'noise':
           final ts = msg['ts'];
           final level = msg['audioLevel'];
@@ -1302,6 +1530,14 @@ class ParentSession {
       if (channel.label != 'health') return;
       _channel = channel;
       channel.onMessage = _onChannelMessage;
+      // Ask for the camera's current controls (F15). The camera also pushes
+      // them when its side opens; whichever lands first wins, both are cheap.
+      _channelSend(channel, {'t': 'get-camera-state'});
+      channel.onDataChannelState = (state) {
+        if (state == RTCDataChannelState.RTCDataChannelOpen) {
+          _channelSend(channel, {'t': 'get-camera-state'});
+        }
+      };
     };
     pc.onConnectionState = (state) {
       debugPrint('ParentSession: pc -> $state');
@@ -1353,6 +1589,9 @@ class ParentSession {
         final seq = msg['seq'];
         final ts = msg['ts'];
         if (seq is num && ts is num) _onHeartbeat(seq.toInt(), ts.toInt());
+        _onAudioLevel(msg['audioLevel']);
+      case 'camera-state':
+        _onCameraState(msg);
       case 'noise':
         final ts = msg['ts'];
         final level = msg['audioLevel'];
@@ -1376,6 +1615,28 @@ class ParentSession {
       debugPrint('ParentSession: latency at connect ${ms}ms'
           '${ms > AppConfig.latencyAlertMs ? ' — EXCEEDS ${AppConfig.latencyAlertMs}ms (F1 alert)' : ''}');
     }
+  }
+
+  void _onAudioLevel(Object? value) {
+    if (value is! num) return;
+    final level = value.toDouble();
+    if (!level.isFinite) return;
+    if (!_audioLevels.isClosed) {
+      _audioLevels.add(level.clamp(0.0, 1.0).toDouble());
+    }
+  }
+
+  void _onCameraState(Map<String, dynamic> msg) {
+    final state = CameraState.fromJson(msg);
+    _cameraState = state;
+    if (!_cameraStates.isClosed) _cameraStates.add(state);
+  }
+
+  /// Sends a camera-control change to the camera (F13/F15). The camera is the
+  /// single source of truth: it applies what it can and broadcasts the result
+  /// back on [cameraStates], so a knob the hardware refuses snaps back.
+  void sendCameraControl(CameraControls controls) {
+    _channelSend(_channel, {'t': 'camera-control', 'controls': controls.toJson()});
   }
 
   void _onNoiseMessage(int tsMs, double audioLevel) {
@@ -1547,6 +1808,8 @@ class ParentSession {
     await _retryCountdown.close();
     await _latencies.close();
     await _securityAlerts.close();
+    await _cameraStates.close();
+    await _audioLevels.close();
   }
 
   Future<void> _disposePc() async {

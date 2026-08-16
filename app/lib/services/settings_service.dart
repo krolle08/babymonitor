@@ -10,6 +10,7 @@ import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/app_config.dart';
+import '../core/camera_controls.dart';
 
 /// Singleton settings store. `await SettingsService.load()` during startup,
 /// then use [SettingsService.instance] (or the returned reference) everywhere.
@@ -54,6 +55,11 @@ class SettingsService {
   static const _kAllowCodeJoins = 'allowCodeJoins';
   static const _kDeviceName = 'deviceName';
   static const _kLanAddrPrefix = 'lanAddr:'; // + camera deviceId
+  static const _kNoiseThreshold = 'noiseThreshold'; // custom bar, F13
+  static const _kNoiseSustainMs = 'noiseSustainMs';
+  static const _kIgnoreSteadySound = 'ignoreSteadySound';
+  static const _kCameraBrightness = 'cameraBrightness'; // F15
+  static const _kCameraNightMode = 'cameraNightMode';
 
   static String _generateDeviceId() {
     final rng = Random.secure();
@@ -107,18 +113,99 @@ class SettingsService {
     return AppConfig.defaultNoiseSensitivity;
   }
 
+  /// Picks one of the three presets. Clears any custom bar (F13) so the
+  /// preset is what actually applies.
   Future<void> setNoiseSensitivity(String value) async {
     if (!AppConfig.noiseThresholds.containsKey(value)) {
       throw ArgumentError.value(
           value, 'noiseSensitivity', "must be 'low', 'medium' or 'high'");
     }
     await _prefs.setString(_kNoiseSensitivity, value);
+    await _prefs.remove(_kNoiseThreshold);
   }
 
-  /// The 0.0–1.0 trigger level for the current [noiseSensitivity].
-  double get noiseThreshold =>
-      AppConfig.noiseThresholds[noiseSensitivity] ??
-      AppConfig.noiseThresholds[AppConfig.defaultNoiseSensitivity]!;
+  /// The 0.0–1.0 trigger level in force: a custom bar set with
+  /// [setNoiseThreshold] if there is one, else the [noiseSensitivity] preset.
+  double get noiseThreshold {
+    final custom = _prefs.getDouble(_kNoiseThreshold);
+    if (custom != null && custom.isFinite) {
+      return custom
+          .clamp(AppConfig.minNoiseThreshold, AppConfig.maxNoiseThreshold)
+          .toDouble();
+    }
+    return AppConfig.noiseThresholds[noiseSensitivity] ??
+        AppConfig.noiseThresholds[AppConfig.defaultNoiseSensitivity]!;
+  }
+
+  /// True when the bar was dragged to a value of its own rather than left on
+  /// one of the three presets.
+  bool get hasCustomNoiseThreshold => _prefs.getDouble(_kNoiseThreshold) != null;
+
+  /// Sets the bar directly (the slider under the live level meter, F13).
+  Future<void> setNoiseThreshold(double value) => _prefs.setDouble(
+        _kNoiseThreshold,
+        value
+            .clamp(AppConfig.minNoiseThreshold, AppConfig.maxNoiseThreshold)
+            .toDouble(),
+      );
+
+  // --- Sound filter (F13) ---
+
+  /// How long a sound must hold above the bar before it alerts.
+  Duration get noiseSustain {
+    final ms = _prefs.getInt(_kNoiseSustainMs);
+    if (ms == null) return AppConfig.defaultNoiseSustain;
+    return Duration(
+        milliseconds: ms.clamp(0, AppConfig.maxNoiseSustain.inMilliseconds));
+  }
+
+  /// Whether steady background sound (breathing, a fan) is filtered out.
+  bool get ignoreSteadySound =>
+      _prefs.getBool(_kIgnoreSteadySound) ?? AppConfig.defaultIgnoreSteadySound;
+
+  /// The complete sound filter the camera's noise gate runs with (F13).
+  SoundFilter get soundFilter => SoundFilter(
+        threshold: noiseThreshold,
+        sustain: noiseSustain,
+        ignoreSteady: ignoreSteadySound,
+      );
+
+  Future<void> setSoundFilter(SoundFilter filter) async {
+    await setNoiseThreshold(filter.threshold);
+    await _prefs.setInt(
+      _kNoiseSustainMs,
+      filter.sustain.inMilliseconds
+          .clamp(0, AppConfig.maxNoiseSustain.inMilliseconds),
+    );
+    await _prefs.setBool(_kIgnoreSteadySound, filter.ignoreSteady);
+  }
+
+  // --- Camera image controls (F15) ---
+
+  /// Picture gain, -1.0 … 1.0 (0.0 = untouched).
+  double get cameraBrightness {
+    final value = _prefs.getDouble(_kCameraBrightness);
+    if (value == null || !value.isFinite) return 0.0;
+    return value.clamp(-1.0, 1.0).toDouble();
+  }
+
+  /// Low-light capture profile (F15). The torch is deliberately *not*
+  /// persisted — a camera that restarts must never light the room by itself.
+  bool get cameraNightMode => _prefs.getBool(_kCameraNightMode) ?? false;
+
+  /// The camera's saved controls, used as the starting point of a session.
+  CameraControls get cameraControls => CameraControls(
+        brightness: cameraBrightness,
+        nightMode: cameraNightMode,
+        sound: soundFilter,
+      );
+
+  Future<void> setCameraControls(CameraControls controls) async {
+    await _prefs.setDouble(
+        _kCameraBrightness, controls.brightness.clamp(-1.0, 1.0).toDouble());
+    await _prefs.setBool(_kCameraNightMode, controls.nightMode);
+    await setSoundFilter(controls.sound);
+  }
 
   // --- Camera reconnect bookkeeping (PROTOCOL §2.1 reclaim) ---
 

@@ -1,12 +1,14 @@
 /// Settings screen (docs/PROTOCOL.md §5.4): server endpoints + family token
-/// (TR7 shared-secret auth — typed once, no accounts, NTR2), noise-alert
-/// sensitivity (F7 AC: configurable low/medium/high) and an About section.
+/// (TR7 shared-secret auth — typed once, no accounts, NTR2), the sound filter
+/// (F7/F13: the alert bar, plus what to ignore) and an About section.
 library;
 
 import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import '../config/app_config.dart';
+import '../core/camera_controls.dart';
 import '../services/settings_service.dart';
 import 'trusted_devices_screen.dart';
 
@@ -25,7 +27,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late final TextEditingController _apiBaseUrl;
   late final TextEditingController _familyToken;
   late final TextEditingController _deviceName;
-  late String _sensitivity;
+  late SoundFilter _filter;
   late String? _role;
   late bool _allowCodeJoins;
   bool _obscureToken = true;
@@ -41,7 +43,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _apiBaseUrl = TextEditingController(text: settings.apiBaseUrl);
     _familyToken = TextEditingController(text: settings.familyToken);
     _deviceName = TextEditingController(text: settings.deviceName);
-    _sensitivity = settings.noiseSensitivity;
+    _filter = settings.soundFilter;
     _role = settings.role;
     _allowCodeJoins = settings.allowCodeJoins;
   }
@@ -72,7 +74,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await settings.setSignalingUrl(_signalingUrl.text.trim());
     await settings.setApiBaseUrl(_apiBaseUrl.text.trim());
     await settings.setFamilyToken(_familyToken.text.trim());
-    await settings.setNoiseSensitivity(_sensitivity);
+    await settings.setSoundFilter(_filter);
     final name = _deviceName.text.trim();
     if (name.isNotEmpty) await settings.setDeviceName(name);
     await settings.setAllowCodeJoins(_allowCodeJoins);
@@ -203,33 +205,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             const SizedBox(height: 24),
-            const _SectionHeader('Alerts'),
-            Card(
-              child: RadioGroup<String>(
-                groupValue: _sensitivity,
-                onChanged: (value) {
-                  if (value != null) setState(() => _sensitivity = value);
-                },
-                child: const Column(
-                  children: [
-                    RadioListTile<String>(
-                      value: 'low',
-                      title: Text('Low sensitivity'),
-                      subtitle: Text('Only loud sounds trigger an alert'),
-                    ),
-                    RadioListTile<String>(
-                      value: 'medium',
-                      title: Text('Medium sensitivity'),
-                      subtitle: Text('Balanced — recommended'),
-                    ),
-                    RadioListTile<String>(
-                      value: 'high',
-                      title: Text('High sensitivity'),
-                      subtitle: Text('Quiet sounds trigger an alert'),
-                    ),
-                  ],
-                ),
-              ),
+            const _SectionHeader('Sound filter'),
+            _SoundFilterCard(
+              filter: _filter,
+              onChanged: (filter) => setState(() => _filter = filter),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Applies when this phone is the camera unit. While watching, a '
+              'parent can also change all of this live from Camera controls — '
+              'with a level meter to aim at.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
             ),
             const SizedBox(height: 24),
             const _SectionHeader('About'),
@@ -260,6 +248,107 @@ class _SettingsScreenState extends State<SettingsScreen> {
               style: FilledButton.styleFrom(
                 padding: const EdgeInsets.symmetric(vertical: 16),
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The F7 bar plus the F13 filters: how loud, how long, and whether steady
+/// background sound (snoring, breathing, a fan) counts at all.
+class _SoundFilterCard extends StatelessWidget {
+  const _SoundFilterCard({required this.filter, required this.onChanged});
+
+  final SoundFilter filter;
+  final ValueChanged<SoundFilter> onChanged;
+
+  static const int _maxSustainSeconds = 15;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final seconds = filter.sustain.inMilliseconds / 1000.0;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Expanded(child: Text('Ignore sounds quieter than')),
+                Text(
+                  '${(filter.threshold * 100).round()}%',
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
+            ),
+            Slider(
+              value: filter.threshold.clamp(
+                  AppConfig.minNoiseThreshold, AppConfig.maxNoiseThreshold),
+              min: AppConfig.minNoiseThreshold,
+              max: AppConfig.maxNoiseThreshold,
+              divisions: 18,
+              onChanged: (value) =>
+                  onChanged(filter.copyWith(threshold: value)),
+            ),
+            Wrap(
+              spacing: 8,
+              children: [
+                for (final entry in const {
+                  'low': 'Only loud',
+                  'medium': 'Balanced',
+                  'high': 'Quiet too',
+                }.entries)
+                  ChoiceChip(
+                    label: Text(entry.value),
+                    selected: (AppConfig.noiseThresholds[entry.key]! -
+                                filter.threshold)
+                            .abs() <
+                        0.001,
+                    onSelected: (_) => onChanged(filter.copyWith(
+                        threshold: AppConfig.noiseThresholds[entry.key]!)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Expanded(child: Text('Ignore sounds shorter than')),
+                Text(
+                  seconds < 0.5 ? 'off' : '${seconds.round()}s',
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                ),
+              ],
+            ),
+            Slider(
+              value: seconds.clamp(0.0, _maxSustainSeconds.toDouble()),
+              max: _maxSustainSeconds.toDouble(),
+              divisions: _maxSustainSeconds,
+              onChanged: (value) => onChanged(
+                  filter.copyWith(sustain: Duration(seconds: value.round()))),
+            ),
+            Text(
+              'Snoring, a cough or a creaking floorboard is over in a second '
+              'or two. A baby who needs you keeps going.',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: filter.ignoreSteady,
+              onChanged: (value) =>
+                  onChanged(filter.copyWith(ignoreSteady: value)),
+              title: const Text('Ignore steady background'),
+              subtitle: const Text(
+                'Learns the room’s quiet level — breathing, a fan, white '
+                'noise — and keeps it from creeping over the bar.',
+              ),
+              isThreeLine: true,
             ),
           ],
         ),

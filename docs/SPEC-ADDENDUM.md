@@ -1,6 +1,7 @@
-# Spec Addendum — v0.1.1
+# Spec Addendum — v0.1.2
 
-Extends `spec.md` with owner-requested features confirmed 2026-07-17. Same conventions.
+Extends `spec.md` with owner-requested features confirmed 2026-07-17 (F8–F12) and
+2026-08-16 (F13–F15). Same conventions.
 
 ---
 
@@ -119,6 +120,111 @@ not even the signaling server has to be trusted.
 - [ ] Revoking a device prevents its next connection and drops it if currently live
 - [ ] Parent alerts loudly if the camera's key changes (MITM/reinstall detection)
 - [ ] Pairing messages are never relayed by the cloud server
+
+---
+
+## F13 — Sound Filter (ignore snoring and breathing)
+
+**Purpose:** A parent should be woken by a baby who needs them, not by snoring,
+breathing, a cough or the fan. F7's single level threshold is not enough: the loudest
+sound in a nursery at 3 a.m. is often the one you least want an alert for.
+
+**Behaviour:**
+- Three independent filters on the camera's noise gate (PROTOCOL §5.2), because
+  "ignore snoring" is three different problems:
+  1. **The bar** — a level 0.05–0.95, dragged directly with a live meter next to it.
+     The F7 low/medium/high presets stay as one-tap shortcuts.
+  2. **Minimum duration** — ignore sound that does not *hold* above the bar
+     (default 2 s). A snore burst, a cough or a creaking floorboard is over in a
+     second or two; a baby who needs someone keeps going.
+  3. **Steady-background rejection** (default on) — the gate learns the room's quiet
+     level and requires a margin above it, so breathing, a fan or a white-noise
+     machine cannot creep over the bar.
+- The gate learns its quiet floor **only from sound below the bar**, so a long cry can
+  never train it into silence (NTR1).
+- Adjustable from the camera unit *and* live from a watching parent (F15 transport),
+  with the same live level meter on both, so you can watch the baby breathe and put
+  the bar just above it.
+- Everything else about F7 is unchanged: 30 s cooldown, snackbar foregrounded,
+  notification backgrounded, `noise` events still logged (F9).
+
+**Known limitation (inherited from F7):** the camera reads its audio level from the
+*outbound* WebRTC stats, so sampling — and therefore the meter and the gate — only
+runs while at least one parent is connected. The camera unit says so instead of
+showing a meter stuck at zero. Sampling without a peer connection would mean running
+a loopback peer connection purely for stats, which the old camera phone cannot afford
+(TR5).
+
+**Acceptance criteria:**
+- [ ] Repeated 1–2 s bursts at any volume raise no alert at the default 2 s setting
+- [ ] Continuous crying still alerts within 5 s of crossing the bar (F7 AC preserved)
+- [ ] Sustained crying keeps re-alerting every 30 s — the filter never goes silent
+- [ ] A background hum that rises towards the bar does not start alerting
+- [ ] The bar, the duration and the steady toggle can all be changed from a parent
+      unit while watching, and take effect on the camera's next sample
+- [ ] The live meter shows the current level against the bar in force on both units,
+      and explains itself when there is nothing to sample
+
+---
+
+## F14 — Full-Screen View (both units)
+
+**Purpose:** Setting the camera up means checking the framing from the doorway, and
+watching means seeing the crib, not the app around it.
+
+**Behaviour:**
+- Both the camera unit's local preview and the parent's live stream have a
+  full-screen mode: system bars hidden (immersive), overlay chrome fading out after
+  4 s, a tap anywhere bringing it back
+- Landscape works in both roles (already permitted by both platform manifests)
+- Full-screen shows the **whole** frame rather than cropping to fill — the point is
+  to confirm the crib is in shot
+- Camera unit's overlay keeps the essentials: parents-watching count, room code,
+  sound meter, controls and exit
+- Leaving the screen, leaving the room or disposing always restores the system bars
+
+**Acceptance criteria:**
+- [ ] Camera unit shows a full-screen preview that makes the framing checkable from
+      across the room before leaving
+- [ ] Parent unit shows the stream full-screen with no app bar and fading chrome
+- [ ] Tapping the picture toggles the overlay; it re-hides after 4 s
+- [ ] System bars are restored on exit, on leave and on dispose — never left hidden
+- [ ] Health badge, reconnect banner and the frozen/failed overlays still appear in
+      full screen (NTR1: an alert is never hidden by a viewing mode)
+
+---
+
+## F15 — Camera Controls from the App (brightness & night mode)
+
+**Purpose:** A monitor you cannot see through at night is not a monitor. The camera
+phone must be adjustable from either unit, without walking into the nursery.
+
+**Behaviour:**
+- One control sheet, same widget on both roles: brightness, night mode, camera light
+  and the F13 sound filter
+- **Brightness** is a render gain (−100 % … +100 %) applied by *both* units, so the
+  framing check on the camera matches what parents see
+- **Night mode** lowers the capture frame rate (`nightCaptureFrameRate`, longer
+  exposure per frame) and applies a night render curve — extra gain, lifted blacks,
+  desaturated, because in low light the colour channels are mostly sensor noise
+- **Camera light** switches the camera phone's torch, off by default and never
+  persisted; greyed out on phones without one (capabilities are reported to parents)
+- Changes travel P2P on the `health` data channel (PROTOCOL §4.1): no server involved,
+  works on LAN with the internet down (NTR7)
+- The camera is the single source of truth — it applies what the hardware allows and
+  broadcasts the result, so a refused control snaps back on every unit
+- Failure to re-capture in night mode falls back to the normal profile and warns,
+  rather than leaving the crib dark (NTR3)
+
+**Acceptance criteria:**
+- [ ] A parent changes brightness and night mode while watching; the camera unit's
+      own preview shows the same picture
+- [ ] Night mode visibly brightens a dim room, and the fallback keeps a picture if
+      the re-capture fails
+- [ ] The camera light can be switched from either unit and is off after a restart
+- [ ] A phone with no torch shows the switch disabled, not broken
+- [ ] Controls are unavailable (with an explanation) until the stream is up, and
+      never block or delay the stream itself
 
 ---
 

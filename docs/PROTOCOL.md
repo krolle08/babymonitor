@@ -127,12 +127,57 @@ JSON text messages:
 |---|---|---|
 | `{t: "hb", seq, ts, audioLevel}` | seq int, ts ms epoch, audioLevel 0–1 | every `heartbeatInterval` (3 s) |
 | `{t: "noise", ts, audioLevel}` | — | on noise-gate fire (30 s cooldown) |
+| `{t: "camera-state", controls, caps}` | see §4.1 | when the channel opens, on `get-camera-state`, and after every applied control change |
 
 Parent → camera on the same channel:
 
 | Message | Fields | Purpose |
 |---|---|---|
 | `{t: "talk", on: bool}` | — | Push-to-talk indicator (F6); camera may show "parent talking". |
+| `{t: "camera-control", controls}` | see §4.1 | Change picture or sound-filter settings (F13/F15). |
+| `{t: "get-camera-state"}` | — | Ask for the current `camera-state` (sent when the parent's channel opens). |
+
+Unknown `t` values MUST be ignored by both sides (forward compatibility, NTR6).
+
+### 4.1 Camera controls (F13/F15)
+
+Camera controls travel **only** on the data channel — P2P, no relay, so neither
+signaling server needs to know about them and a cloud outage cannot touch them
+(NTR7). They are therefore available exactly when a stream is: no open `health`
+channel, no controls.
+
+```jsonc
+{
+  "brightness": 0.0,      // -1.0 … 1.0 render gain, 0.0 = untouched
+  "nightMode": false,     // low-light capture profile + night render curve
+  "light": false,         // camera phone torch
+  "sound": {
+    "threshold": 0.30,    // 0.05 … 0.95 — the bar (F7 presets: .50/.30/.15)
+    "sustainMs": 2000,    // 0 … 15000 — ignore sound shorter than this
+    "ignoreSteady": true  // reject sound only just above the learned floor
+  }
+}
+```
+
+`caps` reports what the hardware can do: `{"torch": bool}`. Parents grey out
+what is not supported instead of offering a switch that does nothing.
+
+Rules:
+
+- **The camera is the single source of truth.** A `camera-control` message is a
+  *partial patch*: absent fields keep their current value. The camera applies
+  what it can, persists the result, and broadcasts `camera-state` to every
+  parent — so a knob the hardware refuses (a phone with no torch) visibly snaps
+  back, and all units always agree on the render settings.
+- `brightness`/`nightMode` are applied at **render** time by both roles, so the
+  camera operator's framing check matches what the parents see. `nightMode`
+  additionally re-captures at `nightCaptureFrameRate` (longer exposure per
+  frame); the swap briefly interrupts the picture and falls back to the normal
+  profile if the re-capture fails.
+- `sound` reconfigures the camera's `NoiseGate` live (F7 AC) — the gate is still
+  the single decision point, and noise alerts (§2.3) are unchanged.
+- The torch is never persisted: a camera that restarts must not light the room
+  on its own.
 
 ---
 
@@ -150,11 +195,20 @@ class AppConfig {
   static const maxReconnectRetries = 5;                        // TR4
   static const backoffSchedule = [3, 6, 12, 30];               // seconds; last repeats
   static const noiseCooldown = Duration(seconds: 30);          // F7
-  static const noiseThresholds = {'low': 0.15, 'medium': 0.30, 'high': 0.50};
+  // Preset bars: 'low' alerts on loud sound only, 'high' also on quiet sound.
+  static const noiseThresholds = {'low': 0.50, 'medium': 0.30, 'high': 0.15};
+  static const defaultNoiseSustain = Duration(seconds: 2);     // F13
+  static const maxNoiseSustain = Duration(seconds: 15);        // F13
+  static const defaultIgnoreSteadySound = true;                // F13
+  static const steadySoundMargin = 0.08;                       // F13
+  static const quietFloorAlpha = 0.05;                         // F13
+  static const captureFrameRate = 15;                          // F15
+  static const nightCaptureFrameRate = 8;                      // F15
   static const latencyAlertMs = 5000;                          // F1
   static const roomGraceMinutes = 10;
   // Runtime-configurable (persisted in SharedPreferences, editable in Settings):
-  // signalingUrl, apiBaseUrl, familyToken, noiseSensitivity
+  // signalingUrl, apiBaseUrl, familyToken, noiseThreshold, noiseSustainMs,
+  // ignoreSteadySound, cameraBrightness, cameraNightMode
 }
 ```
 
@@ -174,8 +228,15 @@ class AppConfig {
   from "frame hash"**: decoded-frame-count delta cannot false-positive on a static
   sleeping baby (spec F5 open question) because the encoder keeps emitting frames while
   the pipeline is alive.
-- `noise_gate.dart` — `bool feed(double level, DateTime now)`; true when level ≥
-  threshold and cooldown elapsed.
+- `noise_gate.dart` — `bool feed(double level, DateTime now)`; true when the level
+  clears the bar, has cleared it for `sustain`, and the cooldown has elapsed
+  (F13). The gate learns the room's quiet floor from **sub-threshold samples
+  only** — deliberately, so a long cry can never train it into silence (NTR1) —
+  and, when `ignoreSteady` is on, also requires `steadySoundMargin` above that
+  floor. `effectiveThreshold` exposes the bar in force for the UI meter.
+- `camera_controls.dart` — `SoundFilter` / `CameraControls` / `CameraCapabilities`
+  / `CameraState` value objects (§4.1) with partial-patch JSON, plus
+  `videoColorMatrix()`, the 4x5 render matrix for brightness/night mode.
 - `heartbeat_tracker.dart` — tracks last-seen seq/time, exposes `missedCount(now)`.
 
 ### 5.3 `lib/services/` — Flutter/plugin-facing
@@ -189,7 +250,8 @@ class AppConfig {
 - `sleep_log_service.dart` — session/event/flag REST client + on-disk JSON queue
   (`path_provider`), flushed with backoff whenever connectivity returns.
 - `noise_monitor.dart` — samples outbound audio level on the camera
-  (via `getStats()` audio source level), feeds `NoiseGate`.
+  (via `getStats()` audio source level), feeds `NoiseGate` and publishes every
+  sample on `levels` for the live meter (F13).
 - `notification_service.dart` — `flutter_local_notifications` init + `showNoiseAlert`,
   `showConnectionAlert` (F7 AC: works backgrounded).
 
@@ -197,7 +259,12 @@ class AppConfig {
 
 `role_picker_screen.dart`, `camera_screen.dart`, `parent_screen.dart`,
 `history_screen.dart` (sessions timeline + per-night bars + flags),
-`settings_screen.dart` (server URLs, family token, noise sensitivity low/med/high).
+`settings_screen.dart` (server URLs, family token, sound filter).
+
+Both role screens offer a full-screen view with fading chrome (F14) and open the
+same `CameraControlsPanel` (F13/F15) — locally on the camera, over the data
+channel from a parent. Video is rendered through `AdjustableVideoView`, which
+applies `videoColorMatrix()`; a neutral setting skips the filter layer entirely.
 
 ---
 
